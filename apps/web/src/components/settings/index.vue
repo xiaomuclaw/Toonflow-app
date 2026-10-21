@@ -22,6 +22,12 @@
         <div class="panelContent">
           <transition name="el-fade-in" mode="out-in">
             <keep-alive include="personalization">
+        <!-- ACT: 设置冲突的可执行恢复入口：重新加载会放弃本地未保存修改（F18）。 -->
+        <el-alert v-if="settingsConflict" class="conflictNotice" type="warning" :closable="false" showIcon
+          title="设置已在其他窗口被修改，本地修改尚未保存">
+          <p class="conflictHint">重新加载会放弃本地未保存的设置修改，请先复制需要的改动。</p>
+          <el-button size="small" type="primary" @click="reloadSettings">重新加载设置</el-button>
+        </el-alert>
               <component
                 :is="activePanel.component"
                 v-bind="
@@ -39,6 +45,7 @@
 import { defineAsyncComponent, shallowRef } from "vue";
 import { hasDesktopUpdate } from "@/stores/desktopUpdate";
 import { isMobile } from "@/lib/platform";
+import { reloadSettings, settingsConflict } from "@/stores/settings";
 import {
   IconPalette,
   IconSettings,
@@ -47,6 +54,7 @@ import {
   IconInfoCircle,
   IconCode,
   IconShieldLock,
+  IconDatabase,
   IconPlugConnected,
   IconUserCog,
   IconSubtitlesAi,
@@ -72,6 +80,7 @@ const settingsPanels = [
     component: defineAsyncComponent(() => import("./panels/pluginMarket/index.vue")),
   },
   { id: "mcp", label: "MCP", icon: IconPlugConnected, groupLabel: "通讯", component: defineAsyncComponent(() => import("./panels/mcp/index.vue")) },
+    { id: "storageCleanup", label: "存储与清理", icon: IconDatabase, component: defineAsyncComponent(() => import("./panels/storageCleanup/index.vue")) },
   ...(!isMobile
     ? [{ id: "deviceLink", label: "设备互联", icon: IconDevices, component: defineAsyncComponent(() => import("./panels/deviceLink.vue")) }]
     : []),

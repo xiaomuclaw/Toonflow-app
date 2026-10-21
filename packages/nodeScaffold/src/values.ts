@@ -1,4 +1,6 @@
-export type NodeMediaValue = { url: string; mimeType: string };
+// W2：媒体输出可携带最小结果元数据（taskId + writeBackToken），供画布保存快照导出同一份回写清单；
+// 旧节点/旧画布没有这两个字段时保持原行为。
+export type NodeMediaValue = { url: string; mimeType: string; taskId?: string; writeBackToken?: string };
 
 export type NodeValueMap = {
   STRING: string;

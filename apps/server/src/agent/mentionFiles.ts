@@ -50,6 +50,9 @@ async function readCanvas(directory: string, canvasId: string) {
   return value;
 }
 
+// ACT: 快速路径未命中时才完整解析，单文件读取预算固定 2 MB，避免把大 JSON 全量读入内存（R26）。
+const canvasParseLimit = 2 * 1024 * 1024;
+
 export async function listMentionCanvases(directory: string, signal: AbortSignal) {
   const canvases: { id: string; name: string }[] = [];
   const folders = [""];
@@ -67,13 +70,28 @@ export async function listMentionCanvases(directory: string, signal: AbortSignal
       if (!entry.isFile() || !/\.json$/i.test(entry.name)) continue;
       const { path } = await u.workspaceFile.resolveWorkspacePath(directory, relativePath);
       const file = await open(path, "r");
+      let head = "";
       try {
         const header = Buffer.alloc(4096);
         const { bytesRead } = await file.read(header, 0, header.length, 0);
-        if (/^\s*\{/.test(header.toString("utf8", 0, bytesRead)) && /"toonflowCanvas"\s*:\s*true\s*[,}]/.test(header.toString("utf8", 0, bytesRead))) {
-          canvases.push({ id: relativePath, name: relativePath.slice(0, -5) });
-        }
+        head = header.toString("utf8", 0, bytesRead);
       } finally { await file.close(); }
+      if (/^\s*\{\s*"toonflowCanvas"\s*:\s*true\s*[,}]/.test(head)) {
+        canvases.push({ id: relativePath, name: relativePath.slice(0, -5) });
+        continue;
+      }
+      // ACT: 快速路径只认首字段标记；其他键序、标记靠后、被截断或嵌套假标记统一走完整解析，仅认顶层 toonflowCanvas === true（R26）。
+      try {
+        const info = await stat(path);
+        if (info.size > canvasParseLimit) {
+          console.warn(`[agent] 画布识别跳过超过 ${canvasParseLimit} 字节的 JSON 文件：${relativePath}`);
+          continue;
+        }
+        const value: unknown = JSON.parse(await readFile(path, "utf8"));
+        if (mentionRecord(value) && value.toonflowCanvas === true) canvases.push({ id: relativePath, name: relativePath.slice(0, -5) });
+      } catch (error) {
+        console.warn(`[agent] 画布识别解析失败，按非画布处理：${relativePath}`, error instanceof Error ? error.message : error);
+      }
     }
   }
   return canvases.sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true }));

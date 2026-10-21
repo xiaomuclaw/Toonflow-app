@@ -5,7 +5,7 @@ import { success } from "@/lib/responseFormat";
 import { translateMessage } from "@/lib/i18n";
 
 export default Router().get("/", async (req, res) => {
-  const canManage = u.workspace.isLocalWorkspaceRequest(req) === true;
+  const canManage = u.workspace.canManageRequest(req) === true;
   const files = await readdir(u.extPlugins.extDirectory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return [];
     throw error;

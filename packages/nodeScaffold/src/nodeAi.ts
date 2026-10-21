@@ -48,6 +48,8 @@ export type NodeAiRequest = {
 export type NodeAiResult = {
   text: string;
   reasoning?: string;
+  /** 服务端返回的结束原因；"length" 表示达到模型输出上限，正文可能被截断。 */
+  stopReason?: string;
 };
 export type NodeAiEvent = { type: "text" | "reasoning"; delta: string }
   | { type: "toolStart"; id: string; name: string; args: unknown }
@@ -436,7 +438,8 @@ export function useNodeAi() {
     if (message.content.some(part => part.type === "toolCall")) throw new Error("AI 已达到 40 轮调用上限，请缩小任务后重试");
     const text = message.content.filter(part => part.type === "text").map(part => part.text).join("");
     const reasoning = message.content.filter(part => part.type === "thinking").map(part => part.thinking).join("");
-    return { text, ...(reasoning ? { reasoning } : {}) };
+    // ACT: 保留 stopReason 供调用方显示截断提示；有工具调用时仍在上面直接抛出，避免半成品被当完整结果使用。
+    return { text, ...(reasoning ? { reasoning } : {}), ...(message.stopReason ? { stopReason: message.stopReason } : {}) };
   }
 
   return { getModels, getMediaModels, getMediaPrice, generateImage, generateVideo, generateAudio, generate };

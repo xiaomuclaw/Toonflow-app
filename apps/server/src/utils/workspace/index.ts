@@ -3,6 +3,7 @@ import { realpath, stat } from "@toonflow/file";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import conf from "@/utils/conf";
 import { getMobileLinkConfig, isMobileLinkRequest } from "@/utils/mobileLink";
+import { isAuthenticatedRequest } from "@/utils/auth";
 import { getRuntimePlatform } from "@/lib/platform";
 
 export function isLocalWorkspaceRequest(req: Request) {
@@ -40,4 +41,9 @@ export async function resolveWorkspace(req: Request, path: string) {
     if (offset !== ".." && !offset.startsWith(`..${sep}`) && !isAbsolute(offset)) return directory;
   }
   throw Object.assign(new Error("服务器部署只能使用服务器工作区"), { status: 403 });
+}
+
+/** 管理类接口授权：本机客户端或已登录的管理员会话；工作区边界仍由 resolveWorkspace 单独限制。 */
+export function canManageRequest(req: Request) {
+  return isLocalWorkspaceRequest(req) || isAuthenticatedRequest(req);
 }

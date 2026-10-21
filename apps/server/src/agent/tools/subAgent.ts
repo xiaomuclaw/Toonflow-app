@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CanvasContext } from "@toonflow/tools-scaffold/runtime";
@@ -6,6 +7,61 @@ import { addUsage, emptyUsage, type SubAgentModel, type SubAgentResult } from "@
 import { createTeamRunner } from "@/agent/teams";
 import { runRemoteTeam } from "@/agent/teams/remote";
 import { listTeams, getRemoteTeam } from "@/utils/teams";
+
+// ACT: 子 Agent 全局并发上限，跨父/子 Agent 共享；这是应用层保护，避免多级委派同时打满模型与工具资源，可按服务器容量调整。
+const maxConcurrentSubAgents = 3;
+type SubAgentSlot = { yielded: boolean };
+let runningSubAgents = 0;
+const waitingSubAgents = new Set<() => void>();
+// ACT: 让出槽位的子 Agent 在等待自己的子任务期间不再占用名额，避免父等待子、子又等待孙时互相占满全部名额造成死锁。
+const subAgentSlot = new AsyncLocalStorage<SubAgentSlot>();
+
+function grantSubAgentSlots() {
+  for (const waiter of waitingSubAgents) {
+    if (runningSubAgents >= maxConcurrentSubAgents) return;
+    waitingSubAgents.delete(waiter);
+    runningSubAgents++;
+    waiter();
+  }
+}
+
+function releaseSubAgentSlot(slot: SubAgentSlot) {
+  if (!slot.yielded) runningSubAgents--;
+  grantSubAgentSlots();
+}
+
+function acquireSubAgentSlot(signal?: AbortSignal): Promise<SubAgentSlot> {
+  signal?.throwIfAborted();
+  const held = subAgentSlot.getStore();
+  if (held && !held.yielded && runningSubAgents >= maxConcurrentSubAgents) {
+    held.yielded = true;
+    runningSubAgents--;
+  }
+  return new Promise<SubAgentSlot>((resolve, reject) => {
+    // ACT: 排队期间可取消；aborted 立即出队并抛出取消原因，不残留等待项。
+    const waiter = () => { signal?.removeEventListener("abort", cancel); resolve({ yielded: false }); };
+    const cancel = () => { waitingSubAgents.delete(waiter); reject(signal!.reason); };
+    waitingSubAgents.add(waiter);
+    signal?.addEventListener("abort", cancel, { once: true });
+    grantSubAgentSlots();
+  });
+}
+
+/**
+ * R10：父任务把槽位让给自己的子任务后，必须在返回工具结果、继续推理前重新通过同一 FIFO 取得槽，
+ * 否则“A 让槽给 D、子任务结束”后 A 与 B/C/D 会一起超限运行。已让出才重取，未让出直接返回（幂等）。
+ */
+function reacquireSubAgentSlot(slot: SubAgentSlot, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!slot.yielded) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const waiter = () => { slot.yielded = false; signal?.removeEventListener("abort", cancel); resolve(); };
+    const cancel = () => { waitingSubAgents.delete(waiter); reject(signal!.reason); };
+    waitingSubAgents.add(waiter);
+    signal?.addEventListener("abort", cancel, { once: true });
+    grantSubAgentSlots();
+  });
+}
 
 const parameters = z.strictObject({
   tasks: z.array(z.strictObject({
@@ -25,7 +81,7 @@ export async function createSubAgentTool({ cwd, tools, canvas, runTask, ...model
   const teams = (await listTeams()).filter(team => team.enabled && !team.loadError);
   const subAgentTool: ToolDefinition = {
     name: "subAgent", label: "子任务与团队",
-    description: `并行执行委派的独立任务。省略 team 创建可继续对话的子 Agent，继承宿主工具，包括提问、继续委派和 report 上报；指定 team 调用已安装团队或外部 A2A。宿主工具：${[...tools.map(tool => tool.name), "subAgent"].join("、")}。团队目录：${JSON.stringify(teams.map(({ name, description, kind }) => ({ name, description, kind })))}。本地团队按清单分工。任务数量、并发数、执行轮次和总时长不设固定上限，可由用户停止。`,
+    description: `并行执行委派的独立任务。省略 team 创建可继续对话的子 Agent，继承宿主工具，包括提问、继续委派和 report 上报；指定 team 调用已安装团队或外部 A2A。宿主工具：${[...tools.map(tool => tool.name), "subAgent"].join("、")}。团队目录：${JSON.stringify(teams.map(({ name, description, kind }) => ({ name, description, kind })))}。本地团队按清单分工。任务数量、执行轮次和总时长不设固定上限，子 Agent 并发由应用层统一排队，可由用户停止。`,
     promptSnippet: "按需使用 subAgent 委派独立工作，或指定已安装 team 调用专用团队。",
     promptGuidelines: [
       "简单任务直接完成；只委派相互独立的工作，提供必要背景和真实授权。并行任务不得修改同一文件或画布，依赖任务分次处理。",
@@ -36,6 +92,8 @@ export async function createSubAgentTool({ cwd, tools, canvas, runTask, ...model
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate) {
       signal?.throwIfAborted();
+      // R10：记录本次调用所属父任务自己的槽位对象；让出后要在继续推理前重新取得。
+      const parentSlot = subAgentSlot.getStore();
       const { tasks } = parameters.parse(params);
       const results: SubAgentResult[] = tasks.map(task => ({ name: task.name, status: "running", result: "准备执行" }));
       const usage = emptyUsage();
@@ -44,21 +102,27 @@ export async function createSubAgentTool({ cwd, tools, canvas, runTask, ...model
       update();
       await Promise.all(tasks.map(async (task, index) => {
         const onProgress = (text: string) => { results[index]!.result = text; update(); };
+        let slot: SubAgentSlot | undefined;
         try {
-          const remote = task.team && getRemoteTeam(task.team);
-          if ((task.taskId || task.contextId) && !remote) throw new Error("只有远端 A2A 团队支持 taskId/contextId");
-          const output = remote
-            ? await runRemoteTeam({ ...task, name: task.team!, signal, onProgress })
-            : task.team
-              ? await (await createTeamRunner({ ...modelOptions, cwd, tools: inheritedTools, canvas, name: task.team })).run(task.task, signal, onProgress)
-              : await runTask(task.name, task.task, signal, onProgress);
+          slot = await acquireSubAgentSlot(signal);
+          const output = await subAgentSlot.run(slot, async () => {
+            const remote = task.team && getRemoteTeam(task.team);
+            if ((task.taskId || task.contextId) && !remote) throw new Error("只有远端 A2A 团队支持 taskId/contextId");
+            if (remote) return runRemoteTeam({ ...task, name: task.team!, signal, onProgress });
+            if (task.team) return (await createTeamRunner({ ...modelOptions, cwd, tools: inheritedTools, canvas, name: task.team })).run(task.task, signal, onProgress);
+            return runTask(task.name, task.task, signal, onProgress);
+          });
           results[index] = { ...output.result, name: task.name };
           addUsage(usage, output.usage);
         } catch (error) {
           results[index] = { name: task.name, status: signal?.aborted ? "cancelled" : "error", result: error instanceof Error ? error.message : String(error) };
+        } finally {
+          if (slot) releaseSubAgentSlot(slot);
         }
         update();
       }));
+      // R10：全部子任务结束、返回工具结果前，父任务重新排队取得自己的槽位；取消时保持已让出状态，由外层释放逻辑处理。
+      if (parentSlot?.yielded) await reacquireSubAgentSlot(parentSlot, signal);
       return { content: content(), details: {}, usage };
     },
   };

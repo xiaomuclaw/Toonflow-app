@@ -6,6 +6,7 @@
       <el-button class="toolbarButton" text :icon="IconFolderPlus" title="新建文件夹" aria-label="新建文件夹" :disabled="newFolderParent !== undefined" @click="startFolder" />
       <el-button class="toolbarButton" text :icon="IconX" title="关闭素材库" aria-label="关闭素材库" @click="visible = false" />
     </div>
+    <el-alert v-if="previewNotice" class="previewNotice" type="warning" :title="previewNotice" showIcon @close="previewNotice = ''" />
     <el-scrollbar class="libraryScroll" maxHeight="min(440px, calc(100dvh - 198px))">
       <el-tree ref="assetTree" class="assetTree" :data="displayEntries" nodeKey="path" :props="{ label: 'name' }" :icon="IconChevronRight" :currentNodeKey="folder === '.' ? undefined : folder" :filterNodeMethod="filterEntry" defaultExpandAll highlightCurrent emptyText="" @nodeClick="selectFolder">
         <template #default="{ data, node }">
@@ -130,6 +131,8 @@ const folderSaving = ref(false);
 const assetMenuRef = ref<InstanceType<typeof assetMenu>>();
 const previewAsset = ref<{ name: string; url: string; kind: "image" | "audio" | "video" }>();
 const previewError = ref("");
+/** T11：素材可用性提示（已清理/缺失）；与播放错误分开显示。 */
+const previewNotice = ref("");
 let loadRequest = 0;
 onBeforeUnmount(() => { loadRequest++; });
 
@@ -148,7 +151,39 @@ function openPreview(entry: AssetEntry) {
   const kind = mediaKind(entry);
   if (!kind) return;
   previewError.value = "";
+  previewNotice.value = "";
   previewAsset.value = { name: entry.name, url: assetUrl(entry.path), kind };
+  // T11：预览前核对可用性；核对必须与实际读取同一资产根与同一身份，且不触发生成。
+  void checkPreviewAvailability(entry);
+}
+
+/**
+ * T11：素材列表与读取都来自全局素材根（/api/assets/*），项目工作目录不是它的根——
+ * 用 project.directory 去做归属/可用性查询会把只存在于全局素材库的正常素材误判为 missing，
+ * 从而错误地关闭预览、停掉播放。这里改用与预览/播放完全相同的素材读取入口探测一次：
+ * 只有该读取入口明确报告文件不存在时才当作不可用；其他失败不阻断（真实读取错误仍由各视图提示）。
+ */
+async function probeAssetReadable(path: string) {
+  try {
+    const response = await fetch(assetUrl(path), { method: "HEAD", cache: "no-store" });
+    if (response.ok || response.status === 206) return true;
+    if (response.status === 404 || response.status === 410) return false;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function checkPreviewAvailability(entry: AssetEntry) {
+  const readable = await probeAssetReadable(entry.path);
+  // 预览已经切到其它素材时丢弃迟到结果。
+  if (previewAsset.value?.url !== assetUrl(entry.path)) return;
+  if (readable !== false) return;
+  const message = "该素材当前不可读取（可能已被清理或已删除）；不会自动重新生成";
+  // 图片直接关闭查看器并给出说明；音视频由预览对话框显示错误并停止播放。
+  if (previewAsset.value?.kind === "image") previewAsset.value = undefined;
+  previewNotice.value = message;
+  previewError.value = message;
 }
 
 function openItemMenu(event: MouseEvent, entry: AssetEntry) {
@@ -252,6 +287,7 @@ watch(visible, opened => {
   else {
     cancelFolder();
     previewAsset.value = undefined;
+    previewNotice.value = "";
   }
 }, { immediate: true });
 
@@ -339,6 +375,11 @@ defineExpose({ openSave });
     flex-direction: column;
     max-height: inherit;
     box-sizing: border-box;
+  }
+
+  .previewNotice {
+    margin: 6px 0 0;
+    --el-alert-padding: 4px 8px;
   }
 
   .libraryToolbar {

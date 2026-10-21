@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, opendir, readFile, realpath, rmdir, unlink } from "@toonflow/file";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import conf from "@/utils/conf";
+import u from "@/utils";
 import { isWithin, lockWorkspaceFiles, protectWorkspaceRoot, renameWorkspaceFile, resolveWorkspacePath, writeWorkspaceFile } from "@/utils/workspace/files";
 import { mentionAssetType, type MentionAsset, type MentionQuery } from "@/agent/mentionSources";
+import { beginFileRegistrationProtection, findFileRelocationWriteBlock, isFileCleanedByCleanup } from "@/utils/fileRecords";
 
 const maxAssetBytes = 100 * 1024 * 1024;
 type AssetSearch = { key: string; directory: string; offset: number; touched: number; busy: boolean; iterator: AsyncGenerator<MentionAsset>;
@@ -50,6 +52,21 @@ export async function readAssetFile(path: string, signal?: AbortSignal) {
 export async function writeAssetFile(path: string, content: string | Uint8Array, revision?: string) {
   if (Buffer.byteLength(content) > maxAssetBytes) throw new Error("素材文件不能超过 100 MB");
   const target = await resolveAssetPath(path);
+  // ACT: 已清理资产不能被上传静默复活（清理记录阻断）。
+  if (await isFileCleanedByCleanup(target.path)) {
+    throw Object.assign(new Error("文件已被自动清理，未覆盖磁盘内容；请使用新文件名重新上传"), { status: 409, code: "ECLEANED" });
+  }
+  // §P.3（R2）：未完成改名事务的两端（含后代）在写入前消费统一保护判定。
+  const relocationBlock = await findFileRelocationWriteBlock(target.path);
+  if (relocationBlock) {
+    throw Object.assign(new Error(relocationBlock.message), { status: 409, code: "ERELOCATING" });
+  }
+  // ACT: 资产上传登记为原始资料；先建立持久登记保护（围栏），登记失败保留围栏并传播给调用方。
+  const body = Buffer.from(content as Uint8Array);
+  const guard = await beginFileRegistrationProtection(
+    { path: target.path, directory: target.directory, sourceKind: "original", mediaKind: "unknown", refs: [] },
+    { expectedContent: { size: body.byteLength, sha256: createHash("sha256").update(body).digest("hex") } },
+  );
   const release = lockWorkspaceFiles([target.path]);
   try {
     if (revision !== undefined) {
@@ -57,7 +74,11 @@ export async function writeAssetFile(path: string, content: string | Uint8Array,
       if (current !== revision) throw Object.assign(new Error("素材已被修改，请重新读取后再更新"), { status: 409, code: "ESTALE" });
     }
     await writeWorkspaceFile(target.path, content, revision === undefined);
+    await guard.complete();
     return { path: relative(target.directory, target.path).split(sep).join("/"), revision: createHash("sha256").update(content).digest("hex") };
+  } catch (error) {
+    await guard.abort().catch(() => undefined);
+    throw error;
   } finally { release(); }
 }
 
@@ -72,17 +93,20 @@ export async function moveAsset(path: string, target: string) {
   const source = await resolveAssetPath(path);
   const destination = await resolveAssetPath(target);
   destination.path = resolve(dirname(destination.path), basename(resolve(destination.directory, target)));
-  const release = lockWorkspaceFiles([source.path, destination.path]);
-  try {
-    if ((await lstat(source.path)).isDirectory()) {
-      if (relative(source.path, destination.path) !== "" && isWithin(source.path, destination.path)) {
-        throw new Error("不能把素材文件夹移动到自身的子目录");
-      }
-      await closeAssetSearches(source.path);
-      await closeAssetSearches(destination.path);
-    }
-    await renameWorkspaceFile(source.path, destination.path);
-  } finally { release(); }
+  // ACT: 素材改名与工作区文件同走归属模块统一协调入口（任务锁顺序 → 路径锁内文件操作、归属/定位事务迁移、
+  // 编辑占用/任务跟进检查、失败回滚与重定位日志，并在同一协调内持久更新受影响任务 outputs 定位）。
+  if ((await lstat(source.path)).isDirectory()) {
+    await closeAssetSearches(source.path);
+    await closeAssetSearches(destination.path);
+  }
+  const result = await u.cleanup.relocateWorkspacePathWithTasks({ directory: source.directory, source: source.path, target: destination.path });
+  if (!result.ok) {
+    throw Object.assign(new Error(result.message), {
+      status: result.code === "EINVALID" ? 400 : result.code === "EMISSING" ? 404
+        : result.code === "EBUSY" || result.code === "EOCCUPIED" || result.code === "EEXIST" || result.code === "EIDENTITY" ? 409 : 500,
+      code: result.code, ...(result.warning ? { warning: result.warning } : {}),
+    });
+  }
 }
 
 export async function removeAsset(path: string) {
@@ -96,6 +120,8 @@ export async function removeAsset(path: string) {
     }
     else if (info.isFile()) await unlink(target.path);
     else throw new Error("只能删除普通素材文件或空文件夹");
+    // 归属清账覆盖目录后代；登记账本失败必须传播，不能留下指向已删除文件的记录。
+    await u.fileRecords.removeFileRecords(target.path);
   } finally { release(); }
 }
 

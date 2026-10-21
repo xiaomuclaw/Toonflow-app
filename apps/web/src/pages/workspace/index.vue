@@ -261,7 +261,12 @@ registerWorkspaceControl({
       callSignal
     );
     checkDirectory();
-    return context.call({ name: request.name, args: request.args }, callSignal);
+    // R17：命令带出预期画布时先复核当前激活画布，不一致直接拒绝，不误写新画布。
+    if (request.expectedCanvasId !== undefined && canvasPanelRef.value?.canvasId !== request.expectedCanvasId) {
+      throw new Error("目标画布已变化，请重新查询");
+    }
+    const canvasRequest = { name: request.name, args: request.args, ...(request.readOnly ? { readOnly: true } : {}), ...(request.expectedCanvasId !== undefined ? { expectedCanvasId: request.expectedCanvasId } : {}) };
+    return context.call(canvasRequest, callSignal);
   },
 });
 

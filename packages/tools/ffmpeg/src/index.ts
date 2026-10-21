@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { chainMethods, executeRemoteFfmpeg, queryMethods, runMethods } from "@toonflow/ffmpeg/remote";
+import { chainMethods, queryMethods, runMethods } from "@toonflow/ffmpeg/remote";
 import type { ToolPlugin } from "@toonflow/tools-scaffold/runtime";
 
 const configSchema = z.strictObject({});
@@ -33,11 +33,14 @@ const plugin: ToolPlugin = {
   createTools(context) {
     async function execute(request: z.infer<typeof processSchema>, signal?: AbortSignal) {
       const ffmpeg = await context.ffmpeg(signal);
+      const runFfmpeg = context.ffmpegExecute;
+      // ACT: 执行必须经宿主唯一入口，保证进程级容量；不在工具 bundle 内自行执行（F11）。
+      if (!runFfmpeg) throw new Error("当前宿主未提供 FFmpeg 执行入口，无法执行");
       let details: unknown;
       let error: Error | undefined;
       let filenames: unknown;
       // ACT: 复用节点已有的 JSON 调用桥接，不在工具层重写参数、输出位置或原生执行规则。
-      await executeRemoteFfmpeg(ffmpeg, {
+      await runFfmpeg(ffmpeg, {
         directory: context.cwd,
         requestId: crypto.randomUUID(),
         options: request.options ?? {},

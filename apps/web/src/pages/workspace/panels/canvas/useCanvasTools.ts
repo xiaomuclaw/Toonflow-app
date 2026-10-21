@@ -1,11 +1,14 @@
 import { nextTick, watch, type Ref } from "vue";
 import { useVueFlow, type XYPosition } from "@vue-flow/core";
 import { useNodeEvent, useNodeToolsContext, validateConnection } from "@toonflow/nodes-scaffold/runtime";
-import { canvasSchemas, type CanvasContext, type CanvasToolCall } from "@toonflow/tool-canvas/runtime";
+import { canvasSchemas, type CanvasControlRequest, type CanvasContext, type CanvasToolCall } from "@toonflow/tool-canvas/runtime";
 import { asrRequestSchema } from "@toonflow/tools-scaffold/runtime";
 import { isBrowserAudioAsrSupported, transcribeBrowserAudio } from "@toonflow/asr";
 import useWorkspaceFiles from "@/lib/workspaceFiles";
 import { useWorkspaceStore } from "@/stores/workspace";
+
+/** 按契约固定为只读的节点状态查询：不修改节点或画布，不得触发全图保存。 */
+const readOnlyNodeTools = new Set(["node:getGenerationStatus"]);
 import { arrangeCanvas } from "./arrangeCanvas";
 import { canvasEdgeSummary, canvasNodeSummary, createCanvasQueries, isCanvasRead } from "./canvasQueries";
 
@@ -77,6 +80,29 @@ export function useCanvasTools(options: {
         canvasSignal.throwIfAborted();
         id = options.getCanvasBinding().id;
         const changesCanvas = request.name === "addCanvas" || request.name === "switchCanvas" || request.name === "renameCanvas";
+  // 只读调用不写画布：画布查询、节点查询函数与选择操作都不需要全图保存（R16）。
+  function isReadOnlyCall(request: CanvasToolCall) {
+    if (isCanvasRead(request.name) || request.name === "selectNodes") return true;
+    if (request.name !== "nodeTools") return false;
+    if ((request as CanvasControlRequest).readOnly === true) return true;
+    const args = canvasSchemas.nodeTools.parse(request.args);
+    if (getNodeTools().isReadOnly({ nodeId: args.nodeId, name: args.name })) return true;
+    // 节点状态查询按契约 E 视为只读：节点组件尚未注册（插件重载中）时也不得触发全图 flush。
+    return readOnlyNodeTools.has(args.name);
+  }
+
+  // 任务受理事实与画布保存结果分开反馈：保存失败不掩盖已返回的 taskId（R16）。
+  async function saveAfterCall(result: unknown) {
+    try {
+      await options.flushSave();
+    } catch (failure) {
+      const taskId = result && typeof result === "object" ? (result as { taskId?: unknown }).taskId : undefined;
+      const message = failure instanceof Error ? failure.message : "画布保存失败";
+      if (typeof taskId === "string" && taskId) throw new Error(`任务已受理（taskId ${taskId}），但画布保存失败：${message}。请重新保存画布，不要重复提交生成`);
+      throw failure;
+    }
+  }
+
         // ACT: 转写按音频时长运行，复用 ASR 的停滞与收尾超时，不套用画布操作的总时限。
         const callSignal = AbortSignal.any([workspaceSignal, ...(changesCanvas ? [] : [canvasSignal]), ...(request.name === "transcribeAudio" ? [] : [AbortSignal.timeout(120000)]), ...(signal ? [signal] : [])]);
         callSignal.throwIfAborted();
@@ -100,7 +126,12 @@ export function useCanvasTools(options: {
                 canvasSignal = binding.signal;
                 result = await execute({ name: "getCanvas", args: {} }, callSignal, id);
               }
-              if (!isCanvasRead(request.name) && request.name !== "selectNodes" && request.name !== "transcribeAudio") await options.flushSave();
+              const expectedCanvasId = (request as CanvasControlRequest).expectedCanvasId;
+              // 执行前重查目标画布：迟到的旧命令不得写入切换后的新画布（R17）。
+              if (expectedCanvasId !== undefined && options.getCanvasBinding().id !== expectedCanvasId) {
+                throw new Error("目标画布已变化，请重新查询");
+              }
+              if (!isReadOnlyCall(request)) await saveAfterCall(result);
               callSignal.throwIfAborted();
               canvasSignal.throwIfAborted();
               return result;

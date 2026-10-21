@@ -178,9 +178,10 @@ function parseProvider(source: string) {
   function value(name: string) {
     const property = entries.get(name);
     if (!property) return undefined;
-    const allowConstant = name === "version" || name === "rules";
+    const allowConstant = name === "version" || name === "rules" || name === "apiUrl";
     if (property.type !== "ObjectProperty" || (property.shorthand && !allowConstant)) invalid(t`${name} 必须直接使用字面量`);
     let expression = unwrap(property.value as Expression);
+    // ACT: version / apiUrl 允许引用顶层 const 字符串（内置供应商用 const baseUrl 声明地址）。
     if (allowConstant && expression.type === "Identifier") {
       const identifier = expression.name;
       const declaration = module.program.body.flatMap(item => item.type === "VariableDeclaration" && item.kind === "const" ? item.declarations : [])
@@ -209,16 +210,25 @@ function parseProvider(source: string) {
   if (!models.success) invalid(models.error.issues.map(issue => translateMessage(issue.message)).join("; "));
   const rules = z.array(z.record(z.string(), z.json())).safeParse(value("rules") ?? []);
   if (!rules.success) invalid("供应商 rules 必须为表单配置对象数组");
+  // ACT: apiUrl 只做只读元数据，缺失或非字面量按未声明处理，不因此拒绝整个供应商。
+  let apiUrl: string | undefined;
+  try {
+    const declared = value("apiUrl");
+    if (typeof declared === "string" && /^https?:\/\//i.test(declared)) apiUrl = declared;
+  } catch {
+    apiUrl = undefined;
+  }
   return { object, modelProperty: entries.get("models"), id: id as string, label, icon, version: version?.trim(), readme, modelsUrl: modelsUrl as string | undefined, rules: rules.data, models: models.data,
+    apiUrl, asyncMedia: entries.has("submitMedia") && entries.has("queryMedia"),
     supportsPrice: entries.has("getPrice") || id === tfRouter.id, supportsBalance: entries.has("getBalance") || id === tfRouter.id };
 }
 
 function metadata(fileName: string, source: string) {
-  const { id, label, icon, version, readme, modelsUrl, rules, models, supportsPrice, supportsBalance } = parseProvider(source);
+  const { id, label, icon, version, readme, modelsUrl, rules, models, apiUrl, asyncMedia, supportsPrice, supportsBalance } = parseProvider(source);
   if (fileName !== `${id}.ts`) invalid("供应商 ID 与文件名不一致");
   // ACT: 兼容旧 TF-Router 文件，缺少列表地址时使用内置定义。
   return { fileName, id, label, icon, version, readme, modelsUrl: modelsUrl ?? (id === tfRouter.id ? tfRouter.modelsUrl : undefined), rules, models,
-    supportsPrice, supportsBalance, revision: createHash("sha256").update(source).digest("hex"), loadError: "" };
+    supportsPrice, supportsBalance, apiUrl, asyncMedia, revision: createHash("sha256").update(source).digest("hex"), loadError: "" };
 }
 
 export function validateMediaProviderSource(source: string) {

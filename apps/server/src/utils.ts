@@ -1,10 +1,14 @@
 import * as assets from "@/utils/assets";
+import * as auth from "@/utils/auth";
+import * as cleanup from "@/utils/cleanup";
+import * as fileRecords from "@/utils/fileRecords";
 import * as browser from "@/utils/browser";
 import * as singleAgent from "@/utils/singleAgent";
 import * as desktop from "@/utils/desktop";
 import * as providerDebug from "@/utils/media/debug";
 import * as mediaGeneration from "@/utils/media/generation";
 import * as mediaTasks from "@/utils/media/tasks";
+import * as mediaTaskScheduler from "@/utils/mediaTasks";
 import * as mediaProvider from "@/utils/media/provider";
 import * as mediaBilling from "@/utils/media/billing";
 import * as ffmpeg from "@/utils/ffmpeg";
@@ -34,6 +38,10 @@ import * as mentionFiles from "@/agent/mentionFiles";
 
 export default {
   assets,
+  auth,
+  cleanup,
+  fileRecords,
+  mediaTaskScheduler,
   browser,
   singleAgent,
   desktop,

@@ -1,5 +1,7 @@
 <template>
   <section ref="panelElement" class="documentPanel" aria-label="文档工作区">
+    <!-- T14：编辑保护登记失败必须可见（不阻断编辑，但明确提示文件可能在清理时被删除）。 -->
+    <el-alert v-if="editingLeaseError" class="editingLeaseError" type="warning" :closable="false" showIcon :title="`编辑保护登记失败：${editingLeaseError}；文件可能在清理时被删除，请检查网络或重新登录后重开编辑器`" />
     <dockview-vue class="documentLayout" :theme="theme" :disableAutoResizing="true" :disableFloatingGroups="true" @ready="onLayoutReady" />
     <openWithDialog ref="openWithRef" />
     <quickOpen v-if="directory" ref="quickOpenRef" :directory="directory" @open="selection => openSelection(selection).catch(reportError)" />
@@ -14,7 +16,7 @@ import { ElMessage } from "element-plus";
 import type { ExtResource } from "@toonflow/ext-scaffold/runtime";
 import { useWorkspaceStore } from "@/stores/workspace";
 import { settings, settingsStorage } from "@/stores/settings";
-import useWorkspaceFiles from "@/lib/workspaceFiles";
+import useWorkspaceFiles, { onEditingHoldError } from "@/lib/workspaceFiles";
 import { waitForControlValue } from "@/lib/mcpControl";
 import { isCanvasFile } from "@/pages/workspace/canvasFile";
 import type { DocumentNode, DocumentNodeOptions } from "../canvas/canvasFiles";
@@ -102,11 +104,46 @@ function addView(id: string, session: DocumentSession, preview = false, position
   if (sessions.has(id) || editorApi.value?.getPanel(id)) throw new Error("标签已打开，请重新选择");
   sessions.set(id, session);
   views.set(id, shallowReactive({ preview, description: "" }));
+  acquireSessionEditingHold(session);
   try {
     editorApi.value!.addPanel({ id, title: session.context.resource.label, component: "extView", tabComponent: "editorTab", params: editorParams(id, session), position });
     updateTabDescriptions();
-  } catch (error) { if (sessions.get(id) === session) { sessions.delete(id); views.delete(id); } throw error; }
+  } catch (error) { if (sessions.get(id) === session) { sessions.delete(id); views.delete(id); releaseSessionEditingHold(session); } throw error; }
 }
+
+// W4/T14：可编辑文档打开期间登记编辑占用（页面实例 pageId 身份、约 30 秒续租、关闭主动释放、断联由服务端宽限兜底）；
+// 文本文件与画布节点（编辑的是其所在画布文件）都登记，普通只读预览不登记、不延长保留期。
+const sessionEditingHolds = new Map<DocumentSession, () => void>();
+const editingLeaseError = ref("");
+function editingHoldTarget(session: DocumentSession) {
+  const resource = session.context.resource;
+  if (resource.kind === "canvasNode") return resource.path;
+  return session.extension.text ? resource.path : undefined;
+}
+function acquireSessionEditingHold(session: DocumentSession) {
+  if (sessionEditingHolds.has(session)) return;
+  const path = editingHoldTarget(session);
+  if (!path) return;
+  try {
+    sessionEditingHolds.set(session, useWorkspaceFiles(session.context.resource.directory).holdEditing(path, {
+      // T14：首次登记失败必须 UI 可见（编辑器/面板显示错误），不得静默假成功。
+      onError: message => { editingLeaseError.value = message; },
+    }));
+  } catch (error) {
+    editingLeaseError.value = documentError(error);
+  }
+}
+function releaseSessionEditingHold(session: DocumentSession) {
+  const release = sessionEditingHolds.get(session);
+  if (!release) return;
+  sessionEditingHolds.delete(session);
+  release();
+}
+// 节点内（视频待回写结果、画布文本节点、图片编辑）的占用失败也汇总到面板提示；同一事件只提示一次。
+const stopEditingHoldErrorListener = onEditingHoldError(detail => {
+  editingLeaseError.value = detail.path ? `${detail.message}（${detail.path}）` : detail.message;
+  ElMessage.error({ message: `编辑保护登记失败：${detail.message}；文件可能在清理时被删除，请重试或重新登录`, grouping: true });
+});
 
 function saveLayout() {
   clearTimeout(layoutTimer);
@@ -206,6 +243,7 @@ async function onEditorReady({ api }: DockviewReadyEvent) {
     extensionVersions.delete(panel.id);
     if (session && !uniqueSessions().includes(session)) {
       session.cancelSave();
+      releaseSessionEditingHold(session);
       sessionWatchers.get(session)?.();
       sessionWatchers.delete(session);
     }
@@ -655,12 +693,16 @@ onBeforeUnmount(() => {
   window.removeEventListener("beforeunload", beforeUnload);
   window.removeEventListener("focus", onWindowFocus);
   window.removeEventListener("keydown", onDocumentKeydown, true);
+  stopEditingHoldErrorListener();
   clearTimeout(layoutTimer);
   saveLayout();
   lifetime.abort(new Error("文档工作区已关闭"));
   cancelSave();
   sessionWatchers.forEach(stop => stop());
   disposables.forEach(disposable => disposable.dispose());
+  // 面板卸载即退出编辑：主动释放全部编辑占用（服务器侧另有断联宽限兜底）。
+  for (const release of sessionEditingHolds.values()) release();
+  sessionEditingHolds.clear();
 });
 defineExpose({ ready, flushSave, cancelSave, getDocument, openDocument, writeDocument, performFileAction });
 </script>
@@ -668,12 +710,21 @@ defineExpose({ ready, flushSave, cancelSave, getDocument, openDocument, writeDoc
 <style lang="scss">
 .documentPanel {
   box-sizing: border-box;
+  position: relative;
   width: 100%;
   height: 100%;
   padding-top: 60px;
   padding-right: var(--agentWidth, 0px);
   overflow: hidden;
   background: var(--el-bg-color);
+  .editingLeaseError {
+    position: absolute;
+    top: 64px;
+    left: 8px;
+    right: 8px;
+    z-index: 5;
+    --el-alert-padding: 4px 10px;
+  }
   .documentLayout { width: 100%; height: 100%; border-top: 1px solid var(--el-border-color); }
   .dockviewToonflow {
     --dv-background-color: var(--el-bg-color);

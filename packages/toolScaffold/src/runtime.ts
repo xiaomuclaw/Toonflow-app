@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Rule } from "@form-create/element-ui";
 import type { FfmpegFactory } from "@toonflow/ffmpeg/types";
+import type { BrowserFfmpegRequest, FfmpegRemoteEvent } from "@toonflow/ffmpeg/browser";
 import type { Stats } from "@toonflow/file";
 import { z } from "zod";
 
@@ -79,6 +80,8 @@ export interface CanvasContext extends CanvasInfo {
 
 export interface MediaModel {
   supportsPrice?: boolean;
+  /** 供应商是否提供持久异步任务（submitMedia/queryMedia）：true 才能交给服务器任务链，false 只能同步等待。 */
+  asyncMedia?: boolean;
   providerId: string;
   providerLabel: string;
   modelId: string;
@@ -194,6 +197,8 @@ export interface ToolFiles {
   remove(path: string, recursive?: boolean): Promise<void>;
   copyFile(path: string, target: string, exclusive?: boolean): Promise<void>;
   importImage(url: string): Promise<{ path: string; mimeType: string }>;
+  /** 宿主唯一执行入口：FFmpeg 远程请求经此执行并共享进程级容量；缺失时工具应报错而不是自行执行（F11）。 */
+  ffmpegExecute?(factory: FfmpegFactory, request: BrowserFfmpegRequest, emit: (event: FfmpegRemoteEvent) => void, signal: AbortSignal): Promise<void>;
 }
 
 export interface ToolContext {

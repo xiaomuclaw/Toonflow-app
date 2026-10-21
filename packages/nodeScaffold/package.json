@@ -17,7 +17,15 @@
     "./nodeFfmpeg": "./src/nodeFfmpeg.ts",
     "./nodeAsr": "./src/nodeAsr.ts",
     "./workspaceFiles": "./src/workspaceFiles.ts",
-    "./nodeTools": "./src/nodeTools.ts"
+    "./nodeTools": "./src/nodeTools.ts",
+    "./promptInput": "./src/components/promptInput.vue",
+    "./videoPlayer": "./src/components/videoPlayer.vue",
+    "./mediaHistory": "./src/components/mediaHistory.vue",
+    "./imageGridSplit": "./src/components/imageGridSplit.vue",
+    "./imageEditor": "./src/components/imageEditor.vue",
+    "./imageInpaintPrompt": "./src/components/imageInpaintPrompt.vue",
+    "./referenceItem": "./src/components/referenceItem.vue",
+    "./showNodeError": "./src/showNodeError.ts"
   },
   "scripts": {
     "typecheck": "vue-tsc --noEmit"

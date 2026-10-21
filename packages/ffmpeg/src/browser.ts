@@ -2,7 +2,7 @@ import { EventSourceParserStream } from "eventsource-parser/stream";
 import { chainMethods, queryMethods, runMethods } from "./browserTypes";
 import type { BrowserFfmpegCommand, BrowserFfmpegFactory, BrowserFfmpegOptions, BrowserFfmpegRequest, FfmpegCall, FfmpegRemoteEvent } from "./browserTypes";
 
-export type { BrowserFfmpegCommand, BrowserFfmpegFactory, BrowserFfmpegOptions, BrowserFfmpegEvents } from "./browserTypes";
+export type { BrowserFfmpegCommand, BrowserFfmpegFactory, BrowserFfmpegOptions, BrowserFfmpegEvents, BrowserFfmpegRequest, FfmpegRemoteEvent } from "./browserTypes";
 export type { FfprobeData, FilterSpecification, ScreenshotsConfig } from "./types";
 
 const chainNames = new Set<string>(chainMethods);

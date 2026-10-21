@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { loadMediaProviderSource } from "@/utils/media/provider";
+import { getSchedulerStatus } from "@/utils/mediaTasks";
 import { t, translateError } from "@/lib/i18n";
 
 export const providerDebugSchema = {
@@ -24,6 +25,14 @@ export async function runProviderSource(
   signal: AbortSignal,
   send: (event: Record<string, unknown>) => void,
 ) {
+  // T03/§N.1（第五轮互审补充）：供应商调试台同样是**真实创建入口**，必须消费与后台/同步入口
+  // 同一的新创建准入判据——全局暂停、任务台账未就绪/恢复未完成、保护与归属未就绪时拒绝发起上游创建。
+  const admission = getSchedulerStatus();
+  if (!admission.ready) {
+    throw Object.assign(new Error(`新生成未获准（供应商调试台）：${admission.dispatchBlockReason ?? "任务台账/保护状态未就绪或已全局暂停"}；请先完成恢复核对或取消暂停`), {
+      status: 503, code: "EBLOCKED",
+    });
+  }
   const startedAt = performance.now();
   const secretFields = /api.?key|secret|token|password|authorization|cookie/i;
   const secrets = Object.entries(config).filter(([key, value]) => secretFields.test(key) && typeof value === "string" && value)

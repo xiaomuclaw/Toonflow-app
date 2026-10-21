@@ -3,10 +3,27 @@ services:
     build: .
     init: true
     restart: unless-stopped
+    # 优雅停机：覆盖应用内部收敛等待与最终落盘（契约 v3 §A.2），避免 Docker 先 SIGKILL 让停机协调没有机会执行。
+    stop_grace_period: 60s
     ports:
-      - "127.0.0.1:3000:3000"
+      # 仅监听回环；公网访问经 Nginx 或 SSH 隧道，不直接裸露业务端口。
+      - "127.0.0.1:3930:3000"
+    environment:
+      # 凭据只从部署目录的 .env（0600）注入，不写死在本文件；首启用于初始化管理员。
+      TOONFLOW_ADMIN_PASSWORD: ${TOONFLOW_ADMIN_PASSWORD:?需要在 .env 提供}
+      TOONFLOW_AUTH: "1"
+      TOONFLOW_BUILD_ID: ${TOONFLOW_BUILD_ID:-dev}
+      # HTTPS 公网部署置 1；本地 http 隧道保持默认 0。
+      TOONFLOW_COOKIE_SECURE: ${TOONFLOW_COOKIE_SECURE:-0}
     volumes:
       - toonflowData:/app/data
+    healthcheck:
+      # 就绪检查：/api/health 校验数据目录可写；不占用认证会话。
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://127.0.0.1:3000/api/health'); if (!r.ok) process.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
   toonflowData:

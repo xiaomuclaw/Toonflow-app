@@ -3,7 +3,7 @@ import { throttle } from "lodash-es";
 import type { AgentEvent } from "@toonflow/server/agent/types";
 import type { AgentMessage, AgentMessagePart } from "./types";
 
-export async function* readAgentEvents<T extends { type: string; message?: string } = AgentEvent>(response: Response, signal: AbortSignal) {
+export async function* readAgentEvents(response: Response, signal: AbortSignal) {
   if (!response.ok) {
     const error = await response.json().catch(() => null);
     throw new Error(error?.message || `请求失败（${response.status}）`);
@@ -21,7 +21,9 @@ export async function* readAgentEvents<T extends { type: string; message?: strin
       if (done) lines.push(pending);
       for (const line of lines) {
         if (!line.trim()) continue;
-        const event = JSON.parse(line) as T;
+        const event = JSON.parse(line) as AgentEvent | { type: "heartbeat" };
+        // R14: 心跳仅用于保持连接，忽略后继续按原协议处理事件。
+        if (event.type === "heartbeat") continue;
         if (event.type === "error") throw new Error(event.message);
         if (event.type === "done") return;
         yield event;

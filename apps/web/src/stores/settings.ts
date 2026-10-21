@@ -9,6 +9,32 @@ import type { ReasoningEfforts, ThinkingLevel } from "@toonflow/server/modelReas
 import "element-plus/es/components/message/style/css";
 
 export const settings = ref<Record<string, unknown>>({});
+// ACT: revision 来自服务端响应头；页面在 loadSettings 完成后才挂载，加载标记仅保留在设置初始化与自动保存内部。
+export const revision = ref("");
+export const settingsConflict = ref(false);
+/** G/T12：保存、重载与发布共用同一串行队列，任何一次读取都不会与另一次发布交错。 */
+let settingsVersion = 0;
+/** T12：本地草稿版本。只有"用户/界面产生的实际修改"才自增（发布写入不计）。 */
+let settingsDraftVersion = 0;
+// G/T12：applyingSettings 用引用计数，一个重载/保存结束不能放开另一个仍在途的发布。
+let applyingCount = 0;
+let conflictNotified = false;
+let pendingReload: Promise<void> | undefined;
+
+function beginApplying() {
+  applyingCount++;
+  applyingSettings = true;
+}
+
+function endApplying() {
+  applyingCount = Math.max(0, applyingCount - 1);
+  if (applyingCount === 0) applyingSettings = false;
+}
+
+function readRevisionHeader(value: unknown) {
+  if (typeof value === "string") return value;
+  return Array.isArray(value) && typeof value[0] === "string" ? value[0] : "";
+}
 // ACT: 页面在 loadSettings 完成后才挂载，加载标记仅保留在设置初始化与自动保存内部。
 let settingsReady = false;
 let saveQueue = Promise.resolve();
@@ -116,7 +142,10 @@ async function loadModelReasoning() {
 
 export async function loadSettings() {
   if (settingsReady) return;
-  const { data } = await axios.get("/api/settings/get", { headers: { "Cache-Control": "no-cache", "x-toonflow-workspace": "1" } });
+  const response = await axios.get("/api/settings/get", { headers: { "Cache-Control": "no-cache", "x-toonflow-workspace": "1" } });
+  const data = response.data;
+  revision.value = readRevisionHeader(response.headers["x-toonflow-settings-revision"]);
+  settingsVersion++;
   if (settingsReady) return;
   if (data.code !== 200 || !data.data || typeof data.data !== "object" || Array.isArray(data.data)) {
     throw new Error("读取设置失败");
@@ -134,28 +163,46 @@ export function saveSettings(update?: (current: Record<string, unknown>) => Reco
     const patch = update?.(settings.value);
     if (update && !patch) return false;
     const requestedNodeMenu = JSON.stringify(((patch?.general ?? settings.value.general) as { nodeMenu?: unknown } | undefined)?.nodeMenu);
-    const { data } = await axios.put<{ code: number; data: { customProviders?: CustomProvider[]; mediaProvider?: { id: string }; modelRefreshErrors?: string[]; nodeMenu?: StoredNodeMenuItem[] | null; aiModels?: ResolvedAiModel[] } | null }>(
-      "/api/settings/save", { settings: { ...settings.value, ...patch } }, { headers: { "x-toonflow-workspace": "1" } },
-    );
+    let response;
+    try {
+      response = await axios.put<{ code: number; data: { customProviders?: CustomProvider[]; mediaProvider?: { id: string }; modelRefreshErrors?: string[]; nodeMenu?: StoredNodeMenuItem[] | null; aiModels?: ResolvedAiModel[] } | null }>(
+        "/api/settings/save",
+        { settings: { ...settings.value, ...patch }, expectedRevision: revision.value || undefined },
+        { headers: { "x-toonflow-workspace": "1" } },
+      );
+    } catch (error) {
+      // 409 表示其他窗口已保存更新版本；保留本地修改，等待用户重新加载后再保存。
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        settingsConflict.value = true;
+        throw Object.assign(new Error("设置已在其他窗口被修改，请重新加载后再保存"), { conflict: true });
+      }
+      throw error;
+    }
+    const data = response.data;
     if (data.code !== 200) throw new Error("保存设置失败");
     if (data.data?.aiModels) applyModelReasoning(data.data.aiModels);
+    revision.value = readRevisionHeader(response.headers["x-toonflow-settings-revision"]) || revision.value;
+    settingsConflict.value = false;
+    conflictNotified = false;
     const providers = data.data?.customProviders;
     if ((patch && Object.hasOwn(patch, "customProviders")) || providers) invalidateNodeModels("language");
     if (patch || providers) {
-      applyingSettings = true;
-      try { settings.value = { ...settings.value, ...patch, ...(providers ? { customProviders: providers } : {}) }; }
-      finally { applyingSettings = false; }
+      // T12：发布也计入 applyingSettings 引用计数并自增版本号，供重载判断响应是否过期。
+      beginApplying();
+      try { settings.value = { ...settings.value, ...patch, ...(providers ? { customProviders: providers } : {}) }; settingsVersion++; }
+      finally { endApplying(); }
     }
     if (data.data && Object.hasOwn(data.data, "nodeMenu")
       && requestedNodeMenu === JSON.stringify((settings.value.general as { nodeMenu?: unknown } | undefined)?.nodeMenu)
       && requestedNodeMenu !== JSON.stringify(data.data.nodeMenu ?? undefined)) {
-      applyingSettings = true;
+      beginApplying();
       try {
         const general = { ...(settings.value.general as Record<string, unknown> | undefined) };
         if (data.data.nodeMenu?.length) general.nodeMenu = data.data.nodeMenu;
         else delete general.nodeMenu;
         settings.value = { ...settings.value, general };
-      } finally { applyingSettings = false; }
+        settingsVersion++;
+      } finally { endApplying(); }
     }
     if (data.data?.mediaProvider) {
       invalidateNodeModels("media");
@@ -171,7 +218,79 @@ export function saveSettings(update?: (current: Record<string, unknown>) => Reco
   return saving;
 }
 
+/**
+ * 供设置面板处理版本冲突：丢弃本地快照，重新读取服务端设置。
+ * 契约 v3 §D.6 / v4 §G、T12：GET→校验→发布整体进入与保存同一条串行队列（并单飞），
+ * 过期响应（队列前后版本已变化）不得覆盖新 settings/revision；重载期间旧排队快照也不会覆盖新读取结果。
+ * T12：GET 在途期间用户仍可编辑——用确实随草稿修改变化的 settingsDraftVersion 保护。
+ */
+export function reloadSettings(): Promise<void> {
+  // 单飞：并发重载复用同一在途请求，避免多份 GET 逆序到达互相覆盖。
+  pendingReload ??= (async () => {
+    const request = saveQueue.then(async () => {
+      const startedVersion = settingsVersion;
+      const startedDraft = settingsDraftVersion;
+      const response = await axios.get("/api/settings/get", { headers: { "Cache-Control": "no-cache", "x-toonflow-workspace": "1" } });
+      const data = response.data;
+      if (data.code !== 200 || !data.data || typeof data.data !== "object" || Array.isArray(data.data)) {
+        throw new Error("读取设置失败，请稍后重试");
+      }
+      const nextRevision = readRevisionHeader(response.headers["x-toonflow-settings-revision"]);
+      if (!nextRevision) throw new Error("设置缺少版本标识，未切换本地状态；请确认服务端已更新后重试");
+      // 队列保证不会交错；版本号仍作双保险：过期响应不发布，保留当前较新的状态。
+      if (settingsVersion !== startedVersion) return;
+      if (settingsDraftVersion !== startedDraft) {
+        throw Object.assign(new Error("重新加载期间有新的本地修改，已保留本地修改未覆盖；请先保存或处理本地修改后再次重新加载"), { draftChanged: true });
+      }
+      beginApplying();
+      try {
+        revision.value = nextRevision;
+        settings.value = data.data;
+        settingsVersion++;
+      } finally {
+        endApplying();
+      }
+      // 等发布引发的监听执行完再无痕恢复自动保存。
+      await nextTick();
+      settingsReady = true;
+      settingsConflict.value = false;
+      conflictNotified = false;
+    });
+    saveQueue = request.then(() => {}, () => {});
+    try {
+      await request;
+    } catch (error) {
+      // 失败路径不改变 settingsReady / revision / settingsConflict：横幅与重试按钮保留，自动保存继续可用。
+      if (axios.isAxiosError(error) && error.response?.status === 401) return;
+      if ((error as { draftChanged?: boolean } | undefined)?.draftChanged) {
+        ElMessage.warning(error instanceof Error ? error.message : "重新加载期间有新的本地修改，已保留本地修改未覆盖");
+        return;
+      }
+      ElMessage.error(axios.isAxiosError<{ message?: string }>(error)
+        ? error.response?.data?.message || "重新加载设置失败，请检查网络后重试"
+        : error instanceof Error ? error.message : "重新加载设置失败，请检查网络后重试");
+    } finally {
+      pendingReload = undefined;
+    }
+  })();
+  return pendingReload;
+}
+
+// T12：发布写入（applyingSettings 内的重载/保存结果）不算草稿修改；其余都是真实的本地草稿变化，
+// 计入 settingsDraftVersion 供 reloadSettings 判断在途 GET 期间草稿是否被改过。
 watch(settings, () => {
   if (!settingsReady || applyingSettings) return;
-  void saveSettings().catch(() => { ElMessage.error("设置保存失败，请稍后重试"); });
+  settingsDraftVersion++;
+  void saveSettings().catch((error: unknown) => {
+    // 会话过期由全局 401 处理负责提示与回到登录，避免重复报错。
+    if (axios.isAxiosError(error) && error.response?.status === 401) return;
+    if (error && typeof error === "object" && "conflict" in error && (error as { conflict?: unknown }).conflict === true) {
+      if (!conflictNotified) {
+        conflictNotified = true;
+        ElMessage.warning("设置已在其他窗口被修改，本地修改未保存；可在设置面板重新加载");
+      }
+      return;
+    }
+    ElMessage.error("设置保存失败，请稍后重试");
+  });
 }, { deep: true, flush: "sync" });

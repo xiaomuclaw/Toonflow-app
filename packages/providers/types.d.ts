@@ -49,14 +49,11 @@ interface MediaRequest {
 
 /** 抽象层的媒体来源；供应商负责转换为平台需要的 URL、文件或字节。 */
 type MediaInput =
-  | { type: "url"; url: string; mimeType?: string; name?: string }
-  | { type: "base64"; data: string; mimeType: string; name?: string }
-  | { type: "binary"; data: Uint8Array; mimeType: string; name?: string };
+  | { type: "url"; url: string; mimeType?: string }
+  | { type: "base64"; data: string; mimeType: string }
+  | { type: "binary"; data: Uint8Array; mimeType: string };
 
 type MediaAsset = MediaInput & { mediaType: "image" | "video" | "audio" };
-
-type MediaImageInfo = { width: number; height: number; format: string };
-type MediaImageResizeOptions = { width?: number; height?: number; format?: "jpeg" | "png" | "webp"; quality?: number };
 
 interface AudioConvertOptions {
   format: "wav" | "mp3";
@@ -83,11 +80,6 @@ interface ProviderTools {
   errorMessage(value: unknown): string;
   hash: typeof Bun.hash;
   image: typeof Bun.Image;
-  /** 公共图片基础处理工具；供应商可在 processMedia 中按自身模型能力使用。 */
-  media: {
-    inspectImage(input: MediaInput): Promise<MediaImageInfo>;
-    resizeImage(input: MediaInput, options: MediaImageResizeOptions): Promise<MediaInput>;
-  };
   /**
    * 音频裁剪转码；仅接受 WAV 格式的内存字节并返回处理后的内存字节，不支持文件路径、URL 或其他压缩格式输入。
    */
@@ -185,6 +177,30 @@ type GenerateMedia<TRequest, TConfig = Record<string, unknown>> = (
   request: TRequest,
 ) => Promise<MediaAsset[]>;
 
+/** 异步媒体任务状态；succeeded 时给出结果资产，url 型由宿主受限下载。 */
+interface ProviderMediaTaskState {
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  assets?: MediaAsset[];
+  /** 已去敏的失败原因。 */
+  error?: string;
+}
+
+/** 可选异步任务能力；提供 submitMedia 时必须同时提供 queryMedia。 */
+type MediaTaskSubmit = (
+  this: ProviderContext,
+  request: ImageRequest | VideoRequest | AudioRequest,
+) => Promise<{ upstreamId: string }>;
+
+type MediaTaskQuery = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<ProviderMediaTaskState>;
+
+type MediaTaskCancel = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<{ confirmed: boolean }>;
+
 interface ProviderUpdateInfo {
   hasUpdate: boolean;
   latestVersion: string;
@@ -227,8 +243,12 @@ interface ProviderDefinition<TRules extends readonly ProviderFormRule[] = readon
   generateImage?: GenerateMedia<ImageRequest, ProviderConfig<TRules>>;
   generateVideo?: GenerateMedia<VideoRequest, ProviderConfig<TRules>>;
   generateAudio?: GenerateMedia<AudioRequest, ProviderConfig<TRules>>;
-  /** 可选的供应商媒体预处理；未实现时保持原请求。 */
-  processMedia?: (this: ProviderContext<ProviderConfig<TRules>>, request: ImageRequest | VideoRequest | AudioRequest) => Promise<ImageRequest | VideoRequest | AudioRequest>;
+  /** 异步任务提交，立即返回上游任务 ID；与 queryMedia/cancelMedia 配套使用。 */
+  submitMedia?: MediaTaskSubmit;
+  /** 查询上游任务状态；succeeded 时返回 url/base64/binary 结果资产。 */
+  queryMedia?: MediaTaskQuery;
+  /** 请求上游取消；confirmed=false 表示上游不支持或未确认。 */
+  cancelMedia?: MediaTaskCancel;
 }
 
 /** 仅用于展示，不参与余额计算；没有额外提示时 tips 返回空字符串。 */

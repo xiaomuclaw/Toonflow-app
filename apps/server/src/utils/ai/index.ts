@@ -72,12 +72,13 @@ export function getModelReasoning(providerId: string, model: z.infer<typeof prov
 }
 
 export function getModelLimits(providerId: string, model: z.infer<typeof providerSchema>["models"][number]) {
-  const limits = modelContextLimits.find(item => item.id === model.id)
-    ?? modelContextLimits.find(item => item.id instanceof RegExp && model.id.search(item.id) !== -1);
-  if (limits) return { contextWindow: limits.contextWindow, maxTokens: limits.maxTokens };
+  // ACT: 用户为该模型显式设置的两项限制优先，静态表与内置模型目录仅作缺省值（R31）。
   if (model.contextWindow != null && model.maxOutputTokens != null) {
     return { contextWindow: model.contextWindow, maxTokens: model.maxOutputTokens };
   }
+  const limits = modelContextLimits.find(item => item.id === model.id)
+    ?? modelContextLimits.find(item => item.id instanceof RegExp && model.id.search(item.id) !== -1);
+  if (limits) return { contextWindow: limits.contextWindow, maxTokens: limits.maxTokens };
   const matches = builtinModels.filter(item => item.id === model.id);
   const exact = matches.find(item => item.provider === providerId);
   const candidates = exact ? [exact] : matches;

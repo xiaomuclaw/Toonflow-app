@@ -115,6 +115,43 @@ watch(() => props.src, cancel, { flush: "sync" });
 watch(() => getCanvas?.()?.id, cancel, { flush: "sync" });
 onBeforeUnmount(cancel);
 
+// T14：图片编辑（标记/局部重绘）期间登记编辑占用，保护被编辑的工作区素材不被清理；
+// 首次登记失败必须可见（节点显示错误）；离开编辑态/组件卸载时主动释放。
+let releaseEditHold: (() => void) | undefined;
+type MediaOutputLike = { value?: { url?: unknown } };
+function editedWorkspacePaths() {
+  const outputs = (node.data as unknown as { outputs?: Record<string, MediaOutputLike | undefined> } | undefined)?.outputs ?? {};
+  const paths: string[] = [];
+  for (const output of Object.values(outputs)) {
+    const url = output?.value?.url;
+    if (typeof url !== "string" || !url) continue;
+    // 只登记工作区相对路径；blob/http/data 链接无法对应受管文件。
+    if (/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(url)) continue;
+    paths.push(url);
+  }
+  return [...new Set(paths)];
+}
+function syncEditHold() {
+  if (mode.value) {
+    if (releaseEditHold) return;
+    const path = editedWorkspacePaths()[0];
+    if (!path) return;
+    try {
+      releaseEditHold = files.getWorkspaceFiles().holdEditing?.(path, { onError: message => showNodeError(message, "图片编辑保护登记失败") });
+    } catch (error) {
+      showNodeError(error, "图片编辑保护登记失败");
+    }
+    return;
+  }
+  releaseEditHold?.();
+  releaseEditHold = undefined;
+}
+watch(mode, syncEditHold, { flush: "sync" });
+onBeforeUnmount(() => {
+  releaseEditHold?.();
+  releaseEditHold = undefined;
+});
+
 async function start(value: "inpaint" | "mark") {
   const image = sourceImage.value;
   if (props.disabled || busy.value || !image?.complete || !image.naturalWidth) return;

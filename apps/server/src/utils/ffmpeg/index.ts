@@ -1,11 +1,9 @@
 import { t, translateError, translateMessage } from "@/lib/i18n";
 import { dirname, join } from "node:path";
-import { build, createFfmpeg, downloadSources, getToolStatus, installFfmpeg, target } from "@toonflow/ffmpeg";
-import type { DownloadState, FfmpegMode, SourceId } from "@toonflow/ffmpeg";
+import { build, clearToolStatusCache, createFfmpeg, downloadSources, executeRemoteFfmpeg, getToolStatus, installFfmpeg, target, wrapFfmpegSlotCommand, wrapFfmpegSlotStatic } from "@toonflow/ffmpeg";
+import type { BrowserFfmpegRequest, DownloadState, FfmpegFactory, FfmpegMode, FfmpegRemoteEvent, SourceId } from "@toonflow/ffmpeg";
 import conf from "@/utils/conf";
 import { getRuntimePlatform } from "@/lib/platform";
-
-export { executeRemoteFfmpeg } from "@toonflow/ffmpeg";
 
 const directory = join(dirname(conf.path), "ffmpeg", target);
 let download: DownloadState = { phase: "idle", received: 0 };
@@ -17,6 +15,13 @@ const requiredListeners = new Set<() => void>();
 export function onRequired(listener: () => void) {
   requiredListeners.add(listener);
   return () => { requiredListeners.delete(listener); };
+}
+
+// ACT: 执行容量与排队统一在 @toonflow/ffmpeg/remote 的进程级信号量处理（R23），避免 HTTP 路由与工具插件两套上限。
+export async function executeWorkspaceFfmpeg(
+  factory: FfmpegFactory, request: BrowserFfmpegRequest, emit: (event: FfmpegRemoteEvent) => void, signal: AbortSignal,
+) {
+  await executeRemoteFfmpeg(factory, request, emit, signal);
 }
 
 export async function createWorkspaceFfmpeg(cwd: string, signal?: AbortSignal) {
@@ -32,7 +37,26 @@ export async function createWorkspaceFfmpeg(cwd: string, signal?: AbortSignal) {
   const ffmpeg = createFfmpeg(cwd);
   ffmpeg.setFfmpegPath(tools.ffmpeg.path);
   ffmpeg.setFfprobePath(tools.ffprobe.path);
-  return ffmpeg;
+  // F11/T18：原生 fluent 工厂（供应商 tool.ffmpeg、Agent 工具等）的每次真实执行都经过宿主进程级容量；
+  // 链式配置方法不占容量；命令实例共享一个"进程租约"（concat 内部 probe→run 不重复拿槽、不死锁）；
+  // clone 返回的实例同样受约束；静态 ffprobe（内部自建实例）经 wrapFfmpegSlotStatic 计入容量；
+  // stream/pipe 内部同步调用 this.run()，由 run 的包装统一计入。
+  const slotSignal = signal ?? new AbortController().signal;
+  // 互审 §L：能力查询静态形式（FfmpegCommand.available*）同样会启动真实 ffmpeg 进程，必须计入宿主进程级容量。
+  const staticSlotMethods = new Set(["ffprobe",
+    "availableFilters", "getAvailableFilters", "availableCodecs", "getAvailableCodecs",
+    "availableEncoders", "getAvailableEncoders", "availableFormats", "getAvailableFormats"]);
+  return new Proxy(ffmpeg, {
+    apply: (target, thisArgument, argumentsList: Parameters<FfmpegFactory>) =>
+      wrapFfmpegSlotCommand(Reflect.apply(target, thisArgument, argumentsList), slotSignal),
+    get: (target, property, receiver) => {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof property === "string" && staticSlotMethods.has(property) && typeof value === "function") {
+        return wrapFfmpegSlotStatic(value as (...values: unknown[]) => unknown, slotSignal);
+      }
+      return value;
+    },
+  }) as FfmpegFactory;
 }
 
 export function getProgress() {
@@ -70,6 +94,8 @@ export function startDownload(source: SourceId) {
   downloadError = undefined;
   void installFfmpeg(directory, source, active.signal, state => { download = state; }).then(() => {
     download = { phase: "completed", received: 0 };
+    // ACT: 安装完成后立即失效版本检查缓存，状态查询与后续执行马上看到新程序，不必等缓存过期。
+    clearToolStatusCache();
   }).catch((error: unknown) => {
     downloadError = error;
     download = active.signal.aborted

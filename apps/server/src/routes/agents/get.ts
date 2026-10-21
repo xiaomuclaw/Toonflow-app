@@ -10,5 +10,5 @@ export default Router().get("/", async (req, res) => {
     builtin: team.kind === "local" && req.app.locals.builtinPlugins.agent.has(team.name),
     ...(team.kind === "local" && team.enabled && settings.enabled ? { cardUrl: `${base}/${team.name}/.well-known/agent-card.json` } : {}),
   }));
-  res.json(success({ agents, canManage: u.workspace.isLocalWorkspaceRequest(req) }));
+  res.json(success({ agents, canManage: u.workspace.canManageRequest(req) }));
 });

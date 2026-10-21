@@ -8,7 +8,7 @@ import { error, success } from "@/lib/responseFormat";
 const router = Router();
 
 export default router.put("/", validateFields({ name: u.nodePlugins.nodeNameSchema, config: z.record(z.string(), z.json()) }), async (req, res) => {
-  if (!u.workspace.isLocalWorkspaceRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机管理节点配置", null, 403));
+  if (!u.workspace.canManageRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机管理节点配置", null, 403));
   const { name, config } = req.body;
   const release = u.workspaceFile.lockWorkspaceFiles([resolve(u.nodePlugins.nodesDirectory, `${name}.umd.js`)]);
   try {

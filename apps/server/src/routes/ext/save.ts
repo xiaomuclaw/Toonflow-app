@@ -6,7 +6,7 @@ import { validateFields } from "@/lib/middleware";
 import { error, success } from "@/lib/responseFormat";
 
 export default Router().put("/", validateFields({ name: u.extPlugins.extNameSchema, config: z.record(z.string(), z.json()) }), async (req, res) => {
-  if (!u.workspace.isLocalWorkspaceRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机管理文件扩展配置", null, 403));
+  if (!u.workspace.canManageRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机管理文件扩展配置", null, 403));
   const { name, config } = req.body;
   const release = u.workspaceFile.lockWorkspaceFiles([resolve(u.extPlugins.extDirectory, `${name}.umd.js`)]);
   try {

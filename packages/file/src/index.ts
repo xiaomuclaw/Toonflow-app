@@ -144,7 +144,15 @@ export function createWriteStream(path: native.PathLike, options?: BufferEncodin
   return createPathStream(path, options, "w", native.createWriteStream);
 }
 
-export async function writeAtomic(path: string, content: string | Uint8Array, options: { exclusive?: boolean; mode?: number } = {}) {
+// ACT: durable 写入用于关键任务记录；Windows 不支持目录 fsync，只在 Linux/macOS 同步父目录。
+async function syncDirectory(directory: string) {
+  if (process.platform === "win32") return;
+  const handle = await promises.open(directory, "r");
+  try { await handle.sync(); }
+  finally { await handle.close(); }
+}
+
+export async function writeAtomic(path: string, content: string | Uint8Array, options: { exclusive?: boolean; mode?: number; durable?: boolean } = {}) {
   return withFileAccess([path], "write", async () => {
     const temporary = join(dirname(path), `.write-${crypto.randomUUID()}.tmp`);
     let failed = false;
@@ -152,7 +160,10 @@ export async function writeAtomic(path: string, content: string | Uint8Array, op
     try {
       const handle = await promises.open(temporary, "wx", options.mode ?? 0o600);
       created = true;
-      try { await handle.writeFile(content); }
+      try {
+        await handle.writeFile(content);
+        if (options.durable) await handle.sync();
+      }
       catch (error) { failed = true; throw error; }
       finally {
         await handle.close().catch(error => {
@@ -165,6 +176,7 @@ export async function writeAtomic(path: string, content: string | Uint8Array, op
         else await promises.link(temporary, path);
       }
       else await stubborn.retry.rename(retryOptions)(temporary, path);
+      if (options.durable) await syncDirectory(dirname(path));
     } finally {
       if (created) await promises.unlink(temporary).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return;
