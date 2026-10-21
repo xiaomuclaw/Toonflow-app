@@ -49,11 +49,14 @@ interface MediaRequest {
 
 /** 抽象层的媒体来源；供应商负责转换为平台需要的 URL、文件或字节。 */
 type MediaInput =
-  | { type: "url"; url: string; mimeType?: string }
-  | { type: "base64"; data: string; mimeType: string }
-  | { type: "binary"; data: Uint8Array; mimeType: string };
+  | { type: "url"; url: string; mimeType?: string; name?: string }
+  | { type: "base64"; data: string; mimeType: string; name?: string }
+  | { type: "binary"; data: Uint8Array; mimeType: string; name?: string };
 
 type MediaAsset = MediaInput & { mediaType: "image" | "video" | "audio" };
+
+type MediaImageInfo = { width: number; height: number; format: string };
+type MediaImageResizeOptions = { width?: number; height?: number; format?: "jpeg" | "png" | "webp"; quality?: number };
 
 interface AudioConvertOptions {
   format: "wav" | "mp3";
@@ -74,17 +77,51 @@ interface FfmpegRequiredError extends Error {
   status: 424;
 }
 
+/** 异步媒体任务状态；succeeded 时给出结果资产，url 型由宿主受限下载。 */
+interface ProviderMediaTaskState {
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  assets?: MediaAsset[];
+  /** 已去敏的失败原因。 */
+  error?: string;
+}
+
+/** 可选异步任务能力；提供 submitMedia 时必须同时提供 queryMedia。 */
+type MediaTaskSubmit = (
+  this: ProviderContext,
+  request: ImageRequest | VideoRequest | AudioRequest,
+) => Promise<{ upstreamId: string }>;
+
+type MediaTaskQuery = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<ProviderMediaTaskState>;
+
+type MediaTaskCancel = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<{ confirmed: boolean }>;
+
 interface ProviderTools {
   fetch: typeof globalThis.fetch;
   /** 提取供应商错误正文中的可读原因，并隐藏配置中的密钥和 URL 查询参数。 */
   errorMessage(value: unknown): string;
   hash: typeof Bun.hash;
   image: typeof Bun.Image;
+  /** 公共图片基础处理工具；供应商可在 processMedia 中按自身模型能力使用。 */
+  media: {
+    inspectImage(input: MediaInput): Promise<MediaImageInfo>;
+    resizeImage(input: MediaInput, options: MediaImageResizeOptions): Promise<MediaInput>;
+  };
   /**
    * 音频裁剪转码；仅接受 WAV 格式的内存字节并返回处理后的内存字节，不支持文件路径、URL 或其他压缩格式输入。
    */
   audio: {
     convert(input: Uint8Array, options: AudioConvertOptions): Promise<{ data: Uint8Array; mimeType: string }>;
+  };
+  /** 公共图片基础处理工具；供应商可在 processMedia 中按自身模型能力使用。 */
+  media: {
+    inspectImage(input: MediaInput): Promise<{ width: number; height: number; format: string }>;
+    resizeImage(input: MediaInput, options: { width?: number; height?: number; format?: "jpeg" | "png" | "webp"; quality?: number }): Promise<MediaInput>;
   };
   /**
    * 获取绑定当前工作区的原生 @renmu/fluent-ffmpeg 工厂，沿用链式调用、事件、流和 ffprobe 回调。
@@ -177,30 +214,6 @@ type GenerateMedia<TRequest, TConfig = Record<string, unknown>> = (
   request: TRequest,
 ) => Promise<MediaAsset[]>;
 
-/** 异步媒体任务状态；succeeded 时给出结果资产，url 型由宿主受限下载。 */
-interface ProviderMediaTaskState {
-  status: "running" | "succeeded" | "failed" | "cancelled";
-  assets?: MediaAsset[];
-  /** 已去敏的失败原因。 */
-  error?: string;
-}
-
-/** 可选异步任务能力；提供 submitMedia 时必须同时提供 queryMedia。 */
-type MediaTaskSubmit = (
-  this: ProviderContext,
-  request: ImageRequest | VideoRequest | AudioRequest,
-) => Promise<{ upstreamId: string }>;
-
-type MediaTaskQuery = (
-  this: ProviderContext,
-  upstreamId: string,
-) => Promise<ProviderMediaTaskState>;
-
-type MediaTaskCancel = (
-  this: ProviderContext,
-  upstreamId: string,
-) => Promise<{ confirmed: boolean }>;
-
 interface ProviderUpdateInfo {
   hasUpdate: boolean;
   latestVersion: string;
@@ -239,16 +252,20 @@ interface ProviderDefinition<TRules extends readonly ProviderFormRule[] = readon
   getPrice?: (this: ProviderContext<ProviderConfig<TRules>>, request: ProviderPriceRequest) => Promise<ProviderPrice | null>;
   /** 查询当前配置账户的余额；计价单位由供应商返回。 */
   getBalance?: (this: ProviderContext<ProviderConfig<TRules>>) => Promise<ProviderBalance>;
-  /** 未实现的方法保持缺省，调用方据此判断能力是否可用。 */
-  generateImage?: GenerateMedia<ImageRequest, ProviderConfig<TRules>>;
-  generateVideo?: GenerateMedia<VideoRequest, ProviderConfig<TRules>>;
-  generateAudio?: GenerateMedia<AudioRequest, ProviderConfig<TRules>>;
+  /** 供应商是否提供持久异步任务（submitMedia/queryMedia）：true 才能交给服务器任务链，false 只能同步等待。 */
+  asyncMedia?: boolean;
   /** 异步任务提交，立即返回上游任务 ID；与 queryMedia/cancelMedia 配套使用。 */
   submitMedia?: MediaTaskSubmit;
   /** 查询上游任务状态；succeeded 时返回 url/base64/binary 结果资产。 */
   queryMedia?: MediaTaskQuery;
   /** 请求上游取消；confirmed=false 表示上游不支持或未确认。 */
   cancelMedia?: MediaTaskCancel;
+  /** 未实现的方法保持缺省，调用方据此判断能力是否可用。 */
+  generateImage?: GenerateMedia<ImageRequest, ProviderConfig<TRules>>;
+  generateVideo?: GenerateMedia<VideoRequest, ProviderConfig<TRules>>;
+  generateAudio?: GenerateMedia<AudioRequest, ProviderConfig<TRules>>;
+  /** 可选的供应商媒体预处理；未实现时保持原请求。 */
+  processMedia?: (this: ProviderContext<ProviderConfig<TRules>>, request: ImageRequest | VideoRequest | AudioRequest) => Promise<ImageRequest | VideoRequest | AudioRequest>;
 }
 
 /** 仅用于展示，不参与余额计算；没有额外提示时 tips 返回空字符串。 */

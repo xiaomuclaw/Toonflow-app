@@ -197,8 +197,6 @@ export interface ToolFiles {
   remove(path: string, recursive?: boolean): Promise<void>;
   copyFile(path: string, target: string, exclusive?: boolean): Promise<void>;
   importImage(url: string): Promise<{ path: string; mimeType: string }>;
-  /** 宿主唯一执行入口：FFmpeg 远程请求经此执行并共享进程级容量；缺失时工具应报错而不是自行执行（F11）。 */
-  ffmpegExecute?(factory: FfmpegFactory, request: BrowserFfmpegRequest, emit: (event: FfmpegRemoteEvent) => void, signal: AbortSignal): Promise<void>;
 }
 
 export interface ToolContext {
@@ -211,6 +209,8 @@ export interface ToolContext {
       onUpdate?: Parameters<ToolDefinition["execute"]>[3]): ReturnType<ToolDefinition["execute"]>;
   };
   ffmpeg(signal?: AbortSignal): Promise<FfmpegFactory>;
+  /** 宿主唯一执行入口：FFmpeg 远程请求经此执行并共享进程级容量；缺失时工具应报错而不是自行执行（F11）。 */
+  ffmpegExecute?(factory: FfmpegFactory, request: BrowserFfmpegRequest, emit: (event: FfmpegRemoteEvent) => void, signal: AbortSignal): Promise<void>;
   media?: MediaContext;
   canvas?: CanvasContext;
   question?: QuestionContext;

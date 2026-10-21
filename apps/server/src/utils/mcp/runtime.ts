@@ -39,8 +39,11 @@ export function getAppRequestHeaders() {
   return { ...runtime?.requestHeaders };
 }
 
-export function stopMcpRuntime() {
-  reloadQueue = reloadQueue.catch(() => {}).then(async () => {
+// ACT: 停机顺序（契约 v3 §A.2）：先置控制连接 closing 拒绝新受理与新派发，再停独立 listener 与
+// settle 队列（closing 后不再 dispatchNext），最后断开剩余控制连接；媒体/清理侧由 index.ts 统一排空。
+export function stopMcpRuntime(reason = "服务正在停止，控制命令已取消") {
+  markControlConnectionsClosing();
+  const stopped = reloadQueue = reloadQueue.catch(() => {}).then(async () => {
     const current = runtime;
     runtime = undefined;
     removeRuntime(current?.file);
@@ -50,8 +53,9 @@ export function stopMcpRuntime() {
       current.server!.close(() => resolve());
       for (const socket of current.sockets ?? []) socket.destroy();
     });
+    closeAllControlConnections(reason);
   });
-  return reloadQueue;
+  return stopped;
 }
 
 export function reloadMcpRuntime() {
@@ -130,25 +134,3 @@ conf.onDidChange("settings", (next, previous) => {
 });
 
 process.once("exit", () => removeRuntime(runtime?.file));
-
-/**
- * 停机入口（I 的 index.ts 停机会 await 本函数），顺序按契约 v3 §A.2：
- * 1 置 closing 拒绝新受理与新派发 → 2 停止接收新 MCP 请求并断开独立 listener →
- * 3 settle 队列（settle 内因 closing 不再 dispatchNext）→ 4 取消执行中的调用并清 timer（settle 完成）→
- * 5 断开剩余控制连接。
- */
-export async function stopMcpRuntime(reason = "服务正在停止，控制命令已取消"): Promise<void> {
-  markControlConnectionsClosing();
-  const instance = runtime;
-  runtime = undefined;
-  await new Promise<void>(resolve => {
-    if (!instance?.server) {
-      resolve();
-      return;
-    }
-    instance.server.close(() => resolve());
-    instance.server.closeAllConnections();
-  });
-  removeRuntime(instance?.file);
-  closeAllControlConnections(reason);
-}

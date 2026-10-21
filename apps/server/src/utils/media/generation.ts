@@ -11,6 +11,7 @@ import type { AssetDownloadAuthorization } from "@/utils/media/assetBytes";
 import { beginFileRegistrationProtection, findFileRelocationWriteBlock } from "@/utils/fileRecords";
 import { getSchedulerStatus } from "@/utils/mediaTasks";
 import { beginGeneration, getProviderPrice } from "@/utils/media/billing";
+import { readPriceReference } from "@/utils/media/priceReference";
 import { lockWorkspaceFiles, resolveWorkspacePath, writeWorkspaceFile } from "@/utils/workspace/files";
 
 // ACT: 单请求参考媒体总字节预算，避免一次生成把大量并行参考图读入内存（R10）。
@@ -65,7 +66,7 @@ export async function listMediaModels(): Promise<MediaModel[]> {
     return [{
       providerId: provider.id, providerLabel: provider.label, modelId: model.id, label: model.label, type: model.type,
       // ACT: 暴露供应商持久任务能力，网页节点据此选择持久任务链或同步生成路径（F20）。
-      asyncMedia: provider.asyncMedia,
+      asyncMedia: (provider as { asyncMedia?: boolean }).asyncMedia === true,
       supportsPrice: (provider as { supportsPrice?: boolean }).supportsPrice === true,
       mode: model.mode, durationResolutionMap: model.durationResolutionMap, audio: model.audio,
       ...(model.type === "audio" ? { voices: model.voices } : {}),
@@ -98,18 +99,18 @@ export async function getMediaPrice(directory: string | undefined, mediaType: "i
   const configuration = record(configurations[providerInfo.id]);
   const provider = await loadMediaProviderSource(providerInfo.source, configuration, signal, undefined, directory ? await realpath(directory) : undefined);
   if (!(provider as { getPrice?: unknown }).getPrice) return null;
-  // 估价与正式生成同一参考媒体读取管线；价格参考文件按供应商层约定读取。
-  const images: Extract<MediaInput, { type: "base64" }>[] = [];
-  for (const item of request.images ?? []) images.push(await readReference(directory ?? "", item, "image", signal));
-  const audios: Extract<MediaInput, { type: "base64" }>[] = [];
-  for (const item of request.audios ?? []) audios.push(await readReference(directory ?? "", item, "audio", signal));
+  // 估价只传参考素材元信息（不读文件内容，与上游语义一致）。
+  const priceRef = (item: MediaReference | undefined, type: string) =>
+    item ? readPriceReference(directory ?? "", item, type, signal) : undefined;
+  const priceRefs = (items: MediaReference[] | undefined, type: string) =>
+    items?.length ? Promise.all(items.map(item => readPriceReference(directory ?? "", item, type, signal))) : undefined;
   const prepared = mediaType === "audio"
-    ? { type: "audio" as const, model: request.modelId, text: request.prompt, images, audios }
+    ? { type: "audio" as const, model: request.modelId, text: request.prompt, images: await priceRefs(request.images, "image"), audios: await priceRefs(request.audios, "audio") }
     : mediaType === "image"
-    ? { type: "image" as const, model: request.modelId, prompt: request.prompt, images, ratio: request.ratio, size: request.size }
-    : { type: "video" as const, model: request.modelId, prompt: request.prompt, images, videos: [], audios,
-        firstFrame: request.firstFrame ? await readReference(directory ?? "", request.firstFrame, "image", signal) : undefined,
-        lastFrame: request.lastFrame ? await readReference(directory ?? "", request.lastFrame, "image", signal) : undefined };
+    ? { type: "image" as const, model: request.modelId, prompt: request.prompt, images: await priceRefs(request.images, "image"), ratio: request.ratio, size: request.size }
+    : { type: "video" as const, model: request.modelId, prompt: request.prompt, images: await priceRefs(request.images, "image"),
+        videos: await priceRefs(request.videos, "video"), audios: await priceRefs(request.audios, "audio"),
+        firstFrame: await priceRef(request.firstFrame, "image"), lastFrame: await priceRef(request.lastFrame, "image") };
   return getProviderPrice(provider, prepared);
 }
 

@@ -104,7 +104,7 @@ function dispatchNext(connection: Connection) {
   call.waitTimer = undefined;
   call.dispatchedAt = Date.now();
   // ACT: A2A/MCP 的转写与 Agent 共用浏览器 ASR 超时，避免长音频在两分钟时被截断。
-  call.executionTimer = name === "transcribeAudio" ? undefined : setTimeout(() => {
+  call.executionTimer = call.name === "transcribeAudio" ? undefined : setTimeout(() => {
     if (!connection.response.destroyed) connection.response.write(`data: ${JSON.stringify({ type: "cancel", callId: call.id })}\n\n`);
     call.settle({ error: "控制命令执行超时，已取消" });
   }, controlExecutionTimeoutMs);

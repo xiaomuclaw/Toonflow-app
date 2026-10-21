@@ -26,6 +26,7 @@ export async function createApp({
   skillsRoot,
   agentsRoot,
   pluginRevision,
+  auth,
 }: {
   webRoot: string;
   appVersion?: string;

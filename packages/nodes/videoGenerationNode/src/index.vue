@@ -114,11 +114,11 @@ import { IconCameraAi, IconSparkles, IconArrowUp, IconPlayerStop, IconTransfer, 
 import { nodeSkeleton, nodeTools, showNodeError, useMediaTask, useNode, z, type NodeMediaModel, type NodeVideoRequest, type NodeHandle } from "@toonflow/nodes-scaffold/runtime";
 import { groupNodeModels } from "@toonflow/node-shared/groupNodeModels";
 import { useNodeReferences } from "@toonflow/node-shared/useNodeReferences";
-import promptInput from "@toonflow/node-shared/components/promptInput";
+import promptInput from "@toonflow/nodes-scaffold/components/promptInput";
 import videoPlayer from "@toonflow/nodes-scaffold/videoPlayer";
 import videoActions from "@toonflow/node-video/videoActions";
-import referenceItem from "@toonflow/node-shared/components/referenceItem";
-import mediaHistory from "@toonflow/node-shared/components/mediaHistory";
+import referenceItem from "@toonflow/nodes-scaffold/components/referenceItem";
+import mediaHistory from "@toonflow/nodes-scaffold/components/mediaHistory";
 import generationSettings from "./components/generationSettings.vue";
 
 defineOptions({
