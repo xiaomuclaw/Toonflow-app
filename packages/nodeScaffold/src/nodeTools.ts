@@ -1,7 +1,7 @@
 import { getCurrentScope, onScopeDispose } from "vue";
 import { z } from "zod";
 import { useNodeId, useVueFlow } from "@vue-flow/core";
-import type { NodeToolInfo, NodeToolsContext } from "@toonflow/tools-scaffold/runtime";
+import type { NodeToolCall, NodeToolInfo, NodeToolsContext } from "@toonflow/tools-scaffold/runtime";
 
 export { z };
 export type { NodeToolCall, NodeToolInfo, NodeToolsContext } from "@toonflow/tools-scaffold/runtime";
@@ -10,10 +10,12 @@ export interface NodeToolDefinition<Schema extends z.ZodType = z.ZodType> {
   name: string;
   description: string;
   parameters: Schema;
+  /** 只读查询：执行不修改节点与画布，控制链路不为它触发全图保存；缺省视为变更。 */
+  readOnly?: boolean;
   execute(args: z.output<Schema>, context: { signal?: AbortSignal }): unknown | Promise<unknown>;
 }
 
-type RegisteredNodeTool = NodeToolInfo & Pick<NodeToolDefinition, "execute">;
+type RegisteredNodeTool = NodeToolInfo & Pick<NodeToolDefinition, "execute"> & { readOnly: boolean };
 type NodeToolsIndex = { nodes: Map<string, Map<string, RegisteredNodeTool>>; version: number };
 
 // 共享 Vue Flow 实例上的注册表供各 UMD 访问，不进入画布 JSON。
@@ -90,7 +92,7 @@ export const nodeTools = {
     const name = `node:${definition.name}` as const;
     const key = `${nodeId}:${name}`;
     const entry: RegisteredNodeTool = {
-      nodeId, name, description: definition.description.trim(),
+      nodeId, name, description: definition.description.trim(), readOnly: definition.readOnly === true,
       parameters,
       async execute(args, context) {
         const parsed = await definition.parameters.parseAsync(args);
@@ -121,10 +123,14 @@ export function useNodeToolsContext() {
       }
     }
   }
-  return (): NodeToolsContext => ({
+  return (): NodeToolsContext & { isReadOnly(request: Pick<NodeToolCall, "nodeId" | "name">): boolean } => ({
     get tools() { return [...list([...index.nodes.keys()])]; },
     get version() { return index.version; },
     list,
+    // 未注册或未声明只读的函数按变更处理，避免漏保存真实修改。
+    isReadOnly({ nodeId, name }) {
+      return registry.get(`${nodeId}:${name}`)?.readOnly === true;
+    },
     async call({ nodeId, name, args }, signal) {
       const timeout = AbortSignal.timeout(120000);
       const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;

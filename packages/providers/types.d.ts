@@ -177,6 +177,30 @@ type GenerateMedia<TRequest, TConfig = Record<string, unknown>> = (
   request: TRequest,
 ) => Promise<MediaAsset[]>;
 
+/** 异步媒体任务状态；succeeded 时给出结果资产，url 型由宿主受限下载。 */
+interface ProviderMediaTaskState {
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  assets?: MediaAsset[];
+  /** 已去敏的失败原因。 */
+  error?: string;
+}
+
+/** 可选异步任务能力；提供 submitMedia 时必须同时提供 queryMedia。 */
+type MediaTaskSubmit = (
+  this: ProviderContext,
+  request: ImageRequest | VideoRequest | AudioRequest,
+) => Promise<{ upstreamId: string }>;
+
+type MediaTaskQuery = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<ProviderMediaTaskState>;
+
+type MediaTaskCancel = (
+  this: ProviderContext,
+  upstreamId: string,
+) => Promise<{ confirmed: boolean }>;
+
 interface ProviderUpdateInfo {
   hasUpdate: boolean;
   latestVersion: string;
@@ -208,4 +232,10 @@ interface ProviderDefinition<TRules extends readonly ProviderFormRule[] = readon
   generateImage?: GenerateMedia<ImageRequest, ProviderConfig<TRules>>;
   generateVideo?: GenerateMedia<VideoRequest, ProviderConfig<TRules>>;
   generateAudio?: GenerateMedia<AudioRequest, ProviderConfig<TRules>>;
+  /** 异步任务提交，立即返回上游任务 ID；与 queryMedia/cancelMedia 配套使用。 */
+  submitMedia?: MediaTaskSubmit;
+  /** 查询上游任务状态；succeeded 时返回 url/base64/binary 结果资产。 */
+  queryMedia?: MediaTaskQuery;
+  /** 请求上游取消；confirmed=false 表示上游不支持或未确认。 */
+  cancelMedia?: MediaTaskCancel;
 }

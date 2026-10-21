@@ -2,6 +2,7 @@ import type { Request } from "express";
 import { realpath, stat } from "@toonflow/file";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import conf from "@/utils/conf";
+import { isAuthenticatedRequest } from "@/utils/auth";
 
 export function isLocalWorkspaceRequest(req: Request) {
   const localAddress = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "") && req.get("x-toonflow-local-client") !== "0";
@@ -10,6 +11,11 @@ export function isLocalWorkspaceRequest(req: Request) {
   const localOrigin = `${req.protocol}://${req.get("host")}`;
   const sameOrigin = origin === undefined ? req.get("referer")?.startsWith(`${localOrigin}/`) : origin === localOrigin;
   return localAddress && localHost && sameOrigin && req.get("x-toonflow-workspace") === "1";
+}
+
+/** 管理类接口授权：本机客户端或已登录的管理员会话；工作区边界仍由 resolveWorkspace 单独限制。 */
+export function canManageRequest(req: Request) {
+  return isLocalWorkspaceRequest(req) || isAuthenticatedRequest(req);
 }
 
 export async function resolveWorkspace(req: Request, path: string) {

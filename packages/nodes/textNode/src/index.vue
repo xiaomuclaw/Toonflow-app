@@ -13,6 +13,8 @@
         <el-button text size="small" :disabled="generating || textReloading" @click="editing = true">查看并复制当前正文</el-button>
         <el-button text size="small" :disabled="generating" :loading="textReloading" @click="reloadText">重新读取磁盘</el-button>
       </el-alert>
+      <el-alert v-else-if="availability" class="availabilityHint" :title="availabilityText" type="warning" :closable="false" showIcon />
+      <el-alert v-else-if="truncated" class="truncatedHint" title="已达到模型输出上限，内容可能被截断" type="warning" :closable="false" showIcon />
       <div v-if="outputs.text.value.trim() && previewReady" class="textPreview nopan nowheel" aria-label="文本内容">
         <markdownPreview :modelValue="outputs.text.value" :files="textReady ? textFiles : undefined" :path="textPath" :active="previewReady" />
       </div>
@@ -43,13 +45,15 @@
   </nodeSkeleton>
   <el-dialog v-model="editing" title="编辑文本" width="min(860px, calc(100vw - 32px))" :fullscreen="fullscreen" alignCenter appendToBody @closed="fullscreen = false">
     <div class="textEditor" :class="{ fullscreen }">
+      <!-- T14：编辑保护登记失败必须可见，不静默假成功（文件可能被清理删除）。 -->
+      <el-alert v-if="editingHoldError" class="holdError" type="warning" :closable="false" showIcon :title="`编辑保护登记失败：${editingHoldError}；文件可能在清理时被删除，请检查网络或重新登录`" />
       <markdownEditor v-model="outputs.text.value" :files="textReady ? textFiles : undefined" :path="textPath" :active="editing" :disabled="generating || textReloading" :readonly="!!documentState.error" ariaLabel="编辑文本内容" />
     </div>
   </el-dialog>
 </template>
 
 <script setup lang="ts">
-import { computed, inject, onMounted, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElAlert, ElButton, ElCard, ElSelect, ElDialog, ElOption, ElOptionGroup, ElMessage, ElMessageBox } from "element-plus";
 import { IconEdit, IconFileText, IconSparkles, IconArrowUp } from "@tabler/icons-vue";
 import { groupNodeModels, nodeSkeleton, nodeTools, useNode, useNodeReferences, z, type NodeAiModel, type NodeHandle } from "@toonflow/nodes-scaffold/runtime";
@@ -91,6 +95,8 @@ const model = computed({ get: () => data.value.model ?? "", set: (value: string)
 const models = ref<NodeAiModel[]>([]);
 const modelsLoading = ref(false);
 const generating = ref(false);
+// 服务端返回 stopReason=length 时标记本次生成长度被截断，正文照常保留。
+const truncated = ref(false);
 const selectedModel = computed(() => models.value.find(item => JSON.stringify([item.providerId, item.modelId]) === model.value));
 const modelGroups = computed(() => groupNodeModels(models.value));
 const textReady = ref(false);
@@ -102,12 +108,51 @@ let textSaving = Promise.resolve();
 let textSnapshot: Awaited<ReturnType<typeof textFiles.readTextSnapshot>> | undefined;
 let textRevision = 0;
 const documentState = useNodeDocumentState();
+// T11：文本文件可用性（已清理/缺失）来自公共只读查询；已保存结果重新挂载后仍可核对，不触发生成。
+const availability = ref<"cleaned" | "missing">();
+const availabilityText = computed(() => availability.value === "cleaned"
+  ? "文本文件已被清理：画布保留历史正文，旧文件已按清理规则删除；不会自动重新生成"
+  : "文本文件缺失：工作区中找不到该文件，画布保留历史正文；不会自动重新生成");
+async function checkTextAvailability() {
+  try {
+    const state = await files.getWorkspaceFiles().queryAvailability?.(textPath);
+    if (!state) return;
+    availability.value = state.state === "available" ? undefined : state.state;
+  } catch {
+    // 可用性查询失败不改变正文与提示：仅在成功取得状态时更新。
+  }
+}
+// T14：画布文本节点编辑/生成写入期间登记编辑占用（保护 assets/<nodeId>/content.md 不被清理），
+// 关闭编辑器或生成结束后按 pageId 主动释放；失败必须可见。
+const editingHoldError = ref("");
+let releaseEditingHold: (() => void) | undefined;
+function syncEditingHold() {
+  const shouldHold = (editing.value || generating.value) && textReady.value;
+  if (shouldHold && !releaseEditingHold) {
+    try {
+      releaseEditingHold = files.getWorkspaceFiles().holdEditing?.(textPath, {
+        onError: message => { editingHoldError.value = message; ElMessage.error(`文本编辑保护登记失败：${message}`); },
+      });
+    } catch (error) {
+      editingHoldError.value = error instanceof Error ? error.message : "文本编辑保护登记失败";
+    }
+  } else if (!shouldHold && releaseEditingHold) {
+    releaseEditingHold();
+    releaseEditingHold = undefined;
+    editingHoldError.value = "";
+  }
+}
+watch([editing, generating, textReady], syncEditingHold, { flush: "sync" });
+onBeforeUnmount(() => {
+  releaseEditingHold?.();
+  releaseEditingHold = undefined;
+});
 function saveText(value: string) {
   const revision = ++textRevision;
   documentState.dirty = true;
   textSaving = textSaving.catch(() => {}).then(async () => {
     if (!textSnapshot) throw new Error("文本尚未加载，无法保存");
-    textSnapshot.revision = await textFiles.writeTextSnapshot(textPath, value, textSnapshot);
+    textSnapshot.revision = await textFiles.writeTextSnapshot(textPath, value, textSnapshot, "generatedText");
     textSnapshot.text = value;
     if (revision === textRevision && outputs.value.text.value === value) {
       documentState.dirty = false;
@@ -134,7 +179,7 @@ nodeEvent.on("save", async (reason) => {
   } while (pending !== textSaving);
   if (reason === "reload" && generating.value) throw new Error("文本正在生成，请完成后再刷新节点");
 });
-onMounted(() => { textLoading = loadText(); });
+onMounted(() => { textLoading = loadText().then(() => { void checkTextAvailability(); }); });
 async function loadText(fromDisk = false) {
   textReloading.value = true;
   textReady.value = false;
@@ -157,7 +202,7 @@ async function loadText(fromDisk = false) {
       textSnapshot = await textFiles.readTextSnapshot(textPath);
       if (textSnapshot.text !== value) throw new Error("文本文件已被其他编辑器修改，请重新加载节点");
     } else if (textSnapshot && textSnapshot.text !== value) {
-      textSnapshot.revision = await textFiles.writeTextSnapshot(textPath, value, textSnapshot);
+      textSnapshot.revision = await textFiles.writeTextSnapshot(textPath, value, textSnapshot, "generatedText");
       textSnapshot.text = value;
     }
     outputs.value.text.value = value;
@@ -169,10 +214,13 @@ async function loadText(fromDisk = false) {
     textReady.value = true;
     documentState.dirty = false;
     documentState.error = "";
+    availability.value = undefined;
   } catch (error) {
     documentState.error = (error as { response?: { data?: { message?: string } } })?.response?.data?.message
       || (error instanceof Error ? error.message : "文本加载失败");
     ElMessage.error(documentState.error);
+    // T11：读取失败时用公共查询区分“已被清理/缺失”和一般读取错误。
+    void checkTextAvailability();
   } finally { textReloading.value = false; }
 }
 
@@ -224,6 +272,7 @@ async function generateText() {
   const choice = selectedModel.value;
   if (!textReady.value || generating.value || !choice || !prompt.value.trim()) return;
   generating.value = true;
+  truncated.value = false;
   let text = "";
   try {
     if (refList.value.some(item => item.value === undefined)) throw new Error("引用节点暂无内容，请先补充引用内容");
@@ -240,6 +289,8 @@ async function generateText() {
       },
     });
     outputs.value.text.value = result.text;
+    // ACT: 只在服务端明确返回 length 时提示截断；字段缺失时保持旧行为，不误报。
+    truncated.value = result.stopReason === "length";
   } catch (error) {
     if (error instanceof Error && error.name !== "AbortError") ElMessage.error(error.message);
   } finally {
@@ -258,6 +309,8 @@ nodeTools.register({
   async execute({ text }) {
     if (!textReady.value) throw new Error("文本尚未加载");
     if (generating.value) throw new Error("文本生成中，请稍后修改");
+    // 正文被外部整体替换后，上一次生成的截断提示不再适用。
+    truncated.value = false;
     if (outputs.value.text.value === text) await saveText(text);
     else { outputs.value.text.value = text; await textSaving; }
     return { text };
@@ -270,6 +323,10 @@ nodeTools.register({
   height: min(560px, calc(100dvh - 144px));
   min-height: 0;
 
+  .holdError {
+    margin-bottom: 8px;
+  }
+
   &.fullscreen {
     height: calc(100dvh - 112px);
   }
@@ -277,6 +334,10 @@ nodeTools.register({
 
 .textContent {
   min-height: 110px;
+
+  .availabilityHint {
+    margin-bottom: 8px;
+  }
 
   &.empty {
     display: flex;

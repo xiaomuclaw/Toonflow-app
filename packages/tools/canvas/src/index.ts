@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { ToolPlugin } from "@toonflow/tools-scaffold/runtime";
-import { canvasOperations } from "./runtime";
+import { canvasOperations, canvasReadOperations } from "./runtime";
 
 const plugin: ToolPlugin = {
   validateConfig(config) {
@@ -21,7 +21,9 @@ const plugin: ToolPlugin = {
       parameters: z.toJSONSchema(operation.parameters, { io: "input", target: "draft-07" }),
       executionMode: "sequential",
       async execute(_id, params, signal) {
-        const result = await canvas.call({ name: operation.name, args: operation.parameters.parse(params) }, signal);
+        // readOnly 标记供网页区分只读查询：只读调用不得触发全图保存（R16）。
+        const request = { name: operation.name, args: operation.parameters.parse(params), readOnly: canvasReadOperations.has(operation.name) };
+        const result = await canvas.call(request, signal);
         return { content: [{ type: "text", text: JSON.stringify(result ?? null) }], details: result };
       },
     }));

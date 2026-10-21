@@ -7,7 +7,7 @@
       :src="src"
       :controls="fullscreen"
       playsinline
-      preload="auto"
+      preload="metadata"
       draggable="false"
       :aria-label="label"
       @fullscreenchange="fullscreen = !!video?.matches(':fullscreen')"
@@ -83,7 +83,12 @@ watch(() => src, () => {
   currentTime.value = 0;
   duration.value = 0;
 }, { flush: "sync" });
-onBeforeUnmount(() => captureController?.abort());
+onBeforeUnmount(() => {
+  captureController?.abort();
+  // 卸载时立即释放媒体资源，避免离屏视频继续占用解码与网络。
+  video.value?.removeAttribute("src");
+  video.value?.load();
+});
 
 async function enterFullscreen() {
   if (!video.value) return;
@@ -106,6 +111,8 @@ function formatTime(value: number) {
 function readMetadata(event: Event) {
   const value = video.value?.duration ?? 0;
   duration.value = Number.isFinite(value) ? value : 0;
+  // preload="metadata" 只保证元数据：时长已知即视为可播放，帧数据在播放或截帧时按需加载。
+  ready.value = true;
   emit("loadedmetadata", event);
 }
 
@@ -177,6 +184,26 @@ function loadFrame(source: HTMLVideoElement, time: number, signal: AbortSignal) 
   });
 }
 
+// ACT: preload="metadata" 下当前帧可能尚未解码；只在截帧需要真实像素时才等待数据就绪。
+function ensureFrame(source: HTMLVideoElement, signal: AbortSignal) {
+  if (source.readyState >= 2 && source.videoWidth && source.videoHeight) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => finish(new Error("视频帧读取超时")), 15000);
+    function finish(error?: unknown) {
+      clearTimeout(timer);
+      source.onloadeddata = null;
+      source.onerror = null;
+      signal.removeEventListener("abort", abort);
+      error ? reject(error) : resolve();
+    }
+    function abort() { finish(signal.reason); }
+    source.onloadeddata = () => finish();
+    source.onerror = () => finish(new Error("无法读取视频帧"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 async function captureFrame(command: "current" | "first" | "last") {
   if (!video.value || !ready.value || capturing.value) return;
   if (!nodeTypes?.value?.["remote-imageNode"]) return void ElMessage.error("请先启用图片节点插件");
@@ -198,6 +225,7 @@ async function captureFrame(command: "current" | "first" | "last") {
       source = frameVideo;
     }
     controller.signal.throwIfAborted();
+    await ensureFrame(source, controller.signal);
     const canvas = document.createElement("canvas");
     canvas.width = source.videoWidth;
     canvas.height = source.videoHeight;

@@ -8,7 +8,7 @@ const router = Router();
 
 export default router.get("/", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  const canConfigure = u.workspace.isLocalWorkspaceRequest(req);
+  const canConfigure = u.workspace.canManageRequest(req);
   const files = await readdir(u.nodePlugins.nodesDirectory, { withFileTypes: true }).catch((err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT") return [];
     throw err;

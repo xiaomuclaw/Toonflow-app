@@ -3,7 +3,7 @@ import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { realpath, stat, mkdir, readdir, lstat, rm, rmdir, readFile } from "@toonflow/file";
 import { z } from "zod";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { CanvasContext } from "@toonflow/tools-scaffold/runtime";
+import type { CanvasContext, CanvasToolCall } from "@toonflow/tools-scaffold/runtime";
 import type { McpTool } from "@toonflow/mcp";
 import { createAgentTools } from "@/agent/tools";
 import { run as runAgent } from "@/agent";
@@ -11,7 +11,9 @@ import conf from "@/utils/conf";
 import { callControl, getConnection, listConnections } from "@/utils/mcp/control";
 import { appOperations, runAppOperation } from "@/utils/mcp/operations";
 import { listTools } from "@/utils/plugins/tools";
-import { isWithin, lockWorkspaceFiles, protectWorkspaceRoot, renameWorkspaceFile, resolveWorkspacePath, writeWorkspaceFile } from "@/utils/workspace/files";
+import { isWithin, lockWorkspaceFiles, protectWorkspaceRoot, resolveWorkspacePath, writeWorkspaceFile } from "@/utils/workspace/files";
+import { relocateWorkspacePathWithTasks } from "@/utils/cleanup";
+import { findFileRelocationWriteBlock } from "@/utils/fileRecords";
 
 const targetSchema = z.strictObject({ connectionId: z.uuid().optional(), directory: z.string().min(1).max(4096).optional(), canvasId: z.string().min(1).max(256).optional() });
 const requestSchema = z.strictObject({ target: targetSchema.optional(), args: z.record(z.string(), z.unknown()) });
@@ -40,6 +42,19 @@ async function resolveTarget(target: z.infer<typeof targetSchema> = {}, requireD
   if (target.canvasId && connection?.state.canvasId !== target.canvasId) throw new Error("目标画布已切换，请重新获取 getAppState");
   const directory = requireDirectory ? requestedDirectory ?? await resolveDirectory(connection?.state.directory ?? undefined) : undefined;
   return { connection, directory };
+}
+
+/** 插件工具的画布桥：执行前复核连接状态，并透传 readOnly 与发出时的画布身份（R16/R17）。 */
+function createControlCanvas(connection: NonNullable<ReturnType<typeof getConnection>>, target: z.infer<typeof targetSchema>, directory: string | undefined, signal: AbortSignal): CanvasContext {
+  return {
+    id: connection.state.canvasId ?? "mcp",
+    tools: connection.state.tools,
+    call(request: CanvasToolCall, callSignal?: AbortSignal) {
+      if (target.canvasId && connection.state.canvasId !== target.canvasId) throw new Error("目标画布已切换，请重新获取 getAppState");
+      const readOnly = (request as CanvasToolCall & { readOnly?: boolean }).readOnly;
+      return callControl(connection.id, request.name, request.args, callSignal ?? signal, directory, target.canvasId ?? connection.state.canvasId ?? undefined, readOnly === true);
+    },
+  };
 }
 
 function wrapTool(name: string, description: string, schema: object, execute: (args: Record<string, unknown>, target: z.infer<typeof targetSchema>, signal: AbortSignal) => Promise<unknown>): McpTool {
@@ -127,10 +142,7 @@ export async function getMcpTools(): Promise<McpTool[]> {
     tools.push(wrapTool(definition.name, [definition.description, ...(definition.promptGuidelines ?? [])].join("\n"), definition.parameters, async (args, target, signal) => {
       const { connection, directory } = await resolveTarget(target);
       if (["write", "edit"].includes(definition.name) && typeof args.path === "string") await assertFileNotOpen(directory!, args.path);
-      const canvas: CanvasContext | undefined = connection ? {
-        id: connection.state.canvasId ?? "mcp", tools: connection.state.tools,
-        call: (request, callSignal) => callControl(connection.id, request.name, request.args, callSignal ?? signal, directory),
-      } : undefined;
+      const canvas = connection ? createControlCanvas(connection, target, directory, signal) : undefined;
       const current = (await createAgentTools(directory!, canvas)).find(tool => tool.name === definition.name);
       if (!current) throw new Error("工具已禁用，或所需 Toonflow 页面未连接，请重新读取工具列表");
       // ACT: 现有插件依赖 createTools 注入的宿主能力；MCP 没有 Pi 对话，访问会话能力时明确报错。
@@ -167,15 +179,34 @@ export async function getMcpTools(): Promise<McpTool[]> {
       protectWorkspaceRoot(directory!, destination.path);
       destination.path = resolve(dirname(destination.path), basename(resolve(directory!, args.target!)));
     }
-    const release = lockWorkspaceFiles([source.path, ...(destination ? [destination.path] : [])]);
+    if (args.action === "rename" && destination) {
+      // 互审/T15：MCP 改名与 HTTP/Agent 改名统一走同一事务入口（任务锁 → 路径锁 → 递归归属迁移 + 重定位日志 +
+      // 任务 outputs 定位更新）；不再在此直接 renameWorkspaceFile，避免绕过归属账本、保护表与任务定位。
+      const result = await relocateWorkspacePathWithTasks({ directory: directory!, source: source.path, target: destination.path });
+      if (!result.ok) {
+        const status = result.code === "EINVALID" ? 400 : result.code === "EMISSING" ? 404
+          : result.code === "EBUSY" || result.code === "EOCCUPIED" || result.code === "EEXIST" || result.code === "EIDENTITY" ? 409 : 500;
+        // T15/§P.5（第七轮 R4）：失败出口的保护状态必须进入最终模型可见文本（错误消息本体），
+        // 不能只在 Error 属性上挂（MCP 序列化时属性可能丢失）。
+        throw Object.assign(
+          new Error(result.warning ? `${result.message}（保护状态：${result.warning}）` : result.message),
+          { code: result.code, status, ...(result.warning ? { warning: result.warning } : {}) },
+        );
+      }
+      // T15/§O.3（第六轮互审 3）：MCP 改名成功结果透出 warning（保护仍在，需清理核对），不静默丢弃。
+      return { success: true, ...(result.warning ? { warning: result.warning } : {}) };
+    }
+    const release = lockWorkspaceFiles([source.path]);
     try {
       if (args.action === "writeBinary") {
         if (args.base64 === undefined) throw new Error("写入二进制文件需要 base64");
         const bytes = Buffer.from(args.base64, "base64");
         if (bytes.length > 20 * 1024 * 1024) throw new Error("文件不能超过20MB");
+        // T15/§P.3（第七轮 R2 接线）：未完成改名事务端点（含后代）的普通覆盖写必须被拦（与 HTTP 写路由同一判定）。
+        const writeBlock = await findFileRelocationWriteBlock(source.path);
+        if (writeBlock) throw Object.assign(new Error(writeBlock.message), { code: "ERELOCATING", status: 409 });
         await writeWorkspaceFile(source.path, bytes, args.exclusive);
       } else if (args.action === "mkdir") await mkdir(source.path);
-      else if (destination) await renameWorkspaceFile(source.path, destination.path);
       else if ((await lstat(source.path)).isDirectory() && !args.recursive) await rmdir(source.path);
       else await rm(source.path, { recursive: args.recursive });
     } finally { release(); }
@@ -217,10 +248,7 @@ export async function getMcpTools(): Promise<McpTool[]> {
   tools.push(wrapTool("runAgent", "按用户请求调用 Toonflow 内置 Agent，等待本轮完成并返回对话文件与回复；会使用配置的模型。外部 Agent 可直接操作其他工具，仅需要委托内置 Agent 时调用。支持 MCP 取消，历史保存到工作区。", z.toJSONSchema(runAgentSchema), async (input, target, signal) => {
     const args = runAgentSchema.parse(input);
     const { directory, connection } = await resolveTarget(target);
-    const canvas: CanvasContext | undefined = connection ? {
-      id: connection.state.canvasId ?? "mcp", tools: connection.state.tools,
-      call: (request, callSignal) => callControl(connection.id, request.name, request.args, callSignal ?? signal, directory),
-    } : undefined;
+    const canvas = connection ? createControlCanvas(connection, target, directory, signal) : undefined;
     const blocks = new Map<string, string>();
     let sessionFile = args.sessionFile;
     await runAgent({ ...args, cwd: directory!, canvas, signal }, event => {

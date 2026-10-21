@@ -107,6 +107,7 @@ declare module 'vue' {
     RouterView: typeof import('vue-router')['RouterView']
     Settings: typeof import('./../components/settings/index.vue')['default']
     SkillMenu: typeof import('./../components/agent/skillMenu.vue')['default']
+    StorageCleanup: typeof import('./../components/settings/panels/storageCleanup/index.vue')['default']
     TfAccount: typeof import('./../components/settings/tfAccount.vue')['default']
     TfRechargeDialog: typeof import('./../components/settings/tfRechargeDialog.vue')['default']
     ToolMessage: typeof import('./../components/agent/toolMessage.vue')['default']

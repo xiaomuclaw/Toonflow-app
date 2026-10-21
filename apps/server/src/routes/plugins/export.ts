@@ -15,7 +15,7 @@ export default router.get("/", validateFields({
   type: z.enum(["node", "tool", "skill", "agent", "ext"]),
   name: z.string().min(1).max(96).regex(/^[a-zA-Z0-9][a-zA-Z0-9-]*$/),
 }, "query"), async (req, res) => {
-  if (!u.workspace.isLocalWorkspaceRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机导出插件", null, 403));
+  if (!u.workspace.canManageRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机导出插件", null, 403));
   const { type, name } = req.query as { type: "node" | "tool" | "skill" | "agent" | "ext"; name: string };
   if (type === "agent") {
     const { files } = await u.teams.readTeam(name);

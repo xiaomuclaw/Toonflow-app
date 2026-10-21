@@ -12,6 +12,7 @@ export function useNodeGeneration(outputs: Readonly<Ref<NodeOutputs>>, cancel: (
     name: "getGenerationStatus",
     description: "查询本次打开节点后的生成状态（idle/running/succeeded/failed）、当前输出和最近一次生成错误。当前输出可能来自之前的生成；idle 不表示没有历史输出，只有 succeeded 表示本次生成成功",
     parameters: z.strictObject({}),
+    readOnly: true,
     execute: getStatus,
   });
   nodeTools.register({

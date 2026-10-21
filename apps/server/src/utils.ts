@@ -3,6 +3,10 @@ import * as desktop from "@/utils/desktop";
 import * as providerDebug from "@/utils/media/debug";
 import * as mediaGeneration from "@/utils/media/generation";
 import * as mediaProvider from "@/utils/media/provider";
+import * as mediaTasks from "@/utils/mediaTasks";
+import * as fileRecords from "@/utils/fileRecords";
+import * as cleanup from "@/utils/cleanup";
+import * as auth from "@/utils/auth";
 import * as ffmpeg from "@/utils/ffmpeg";
 import * as pluginInstall from "@/utils/plugins/install";
 import conf, { removeLegacySettings } from "@/utils/conf";
@@ -29,6 +33,10 @@ export default {
   providerDebug,
   mediaGeneration,
   mediaProvider,
+  mediaTasks,
+  fileRecords,
+  cleanup,
+  auth,
   ffmpeg,
   pluginInstall,
   conf,

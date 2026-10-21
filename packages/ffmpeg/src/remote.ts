@@ -2,6 +2,8 @@ import { msg } from "@toonflow/i18n";
 import { messageError } from "@toonflow/i18n/errors";
 import { chainMethods, queryMethods, runMethods } from "./browserTypes";
 import type { BrowserFfmpegRequest, FfmpegCall, FfmpegRemoteEvent } from "./browserTypes";
+import { acquireFfmpegSlot } from "./slot";
+import { markFfmpegSlotHeld, waitForRealExit } from "./commandSlot";
 import type { FfmpegCommand, FfmpegFactory } from "./types";
 
 export { chainMethods, queryMethods, runMethods } from "./browserTypes";
@@ -26,13 +28,14 @@ function invoke(command: FfmpegCommand, call: FfmpegCall, extra: unknown[] = [])
   return Reflect.apply((command as unknown as Record<string, (...args: unknown[]) => unknown>)[call.method]!, command, [...args, ...extra]);
 }
 
-/** 浏览器只传链式调用数据，执行及显式路径检查仍使用原生工作区工厂。 */
+/** 浏览器只传链式调用数据，执行及显式路径检查仍使用原生工作区工厂。容量由 ./slot 的进程级信号量统一约束。 */
 export async function executeRemoteFfmpeg(
   factory: FfmpegFactory,
   request: BrowserFfmpegRequest,
   emit: (event: FfmpegRemoteEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
+  const release = await acquireFfmpegSlot(signal);
   try {
     signal.throwIfAborted();
     for (const call of request.calls) {
@@ -43,6 +46,8 @@ export async function executeRemoteFfmpeg(
       throw messageError(msg`FFmpeg 执行方法不可用：${operation.method}`);
     }
     let command = factory(request.options);
+    // F11：本入口已持有执行槽；标记命令避免包装后的终态方法重复拿槽（双重占用会减少容量并可能死锁）。
+    markFfmpegSlotHeld(command);
     for (const call of request.calls) command = invoke(command, call) as FfmpegCommand;
     await new Promise<void>(resolve => {
       let finished = false;
@@ -69,7 +74,13 @@ export async function executeRemoteFfmpeg(
         if (signal.aborted) command.kill("SIGKILL");
         else send("start", args);
       });
-      command.on("error", fail);
+      command.on("error", (...args: unknown[]) => {
+        // T18/第四轮：fluent 在输入流错误、超时、输出流错误分支先 emitEnd(error) 再 kill（processor.js 450-499），
+        // 命令 error 早于子进程真实退出；外层名额必须等真实退出后再释放，否则会提前放行下一作业、
+        // 也会让调用方以为输出可安全清理。准备阶段（无子进程）的错误立即完成。
+        const [error, ...rest] = args;
+        waitForRealExit(command, () => fail(error, ...rest));
+      });
       command.on("end", (...args) => finish("end", args));
       for (const event of ["progress", "stderr", "codecData", "filenames"] as const) {
         command.addListener(event, (...args: unknown[]) => send(event, args));
@@ -88,5 +99,7 @@ export async function executeRemoteFfmpeg(
     });
   } catch (error) {
     emit({ event: "error", args: [serializeError(error)] });
+  } finally {
+    release?.();
   }
 }

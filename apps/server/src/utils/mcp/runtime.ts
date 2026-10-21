@@ -5,7 +5,7 @@ import { createServer, type Server } from "node:http";
 import { dirname, resolve } from "node:path";
 import type { Express } from "express";
 import conf from "@/utils/conf";
-import { getMcpSettings } from "@/utils/mcp/control";
+import { closeAllControlConnections, getMcpSettings, markControlConnectionsClosing } from "@/utils/mcp/control";
 
 let runtime: { app: Express; appOrigin: string; server?: Server; url?: string; port?: number; preferredPort?: number; file?: string; command: string; entry: string; error?: string } | undefined;
 let reloadQueue = Promise.resolve();
@@ -98,6 +98,28 @@ export function getMcpRuntime() {
       ? { command: runtime.command, args: [runtime.entry, "--runtime", runtime.file] }
       : null,
   };
+}
+
+/**
+ * 停机入口（I 的 index.ts 停机会 await 本函数），顺序按契约 v3 §A.2：
+ * 1 置 closing 拒绝新受理与新派发 → 2 停止接收新 MCP 请求并断开独立 listener →
+ * 3 settle 队列（settle 内因 closing 不再 dispatchNext）→ 4 取消执行中的调用并清 timer（settle 完成）→
+ * 5 断开剩余控制连接。
+ */
+export async function stopMcpRuntime(reason = "服务正在停止，控制命令已取消"): Promise<void> {
+  markControlConnectionsClosing();
+  const instance = runtime;
+  runtime = undefined;
+  await new Promise<void>(resolve => {
+    if (!instance?.server) {
+      resolve();
+      return;
+    }
+    instance.server.close(() => resolve());
+    instance.server.closeAllConnections();
+  });
+  removeRuntime(instance?.file);
+  closeAllControlConnections(reason);
 }
 
 conf.onDidChange("settings", (next, previous) => {

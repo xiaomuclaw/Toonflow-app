@@ -149,11 +149,12 @@ function parseProvider(source: string) {
     if (!property) return undefined;
     if (property.type !== "ObjectProperty" || (property.shorthand && name !== "version")) invalid(t`${name} 必须直接使用字面量`);
     let expression = unwrap(property.value as Expression);
-    if (name === "version" && expression.type === "Identifier") {
+    // ACT: version / apiUrl 允许引用顶层 const 字符串（内置供应商用 const baseUrl 声明地址）。
+    if ((name === "version" || name === "apiUrl") && expression.type === "Identifier") {
       const identifier = expression.name;
       const declaration = module.program.body.flatMap(item => item.type === "VariableDeclaration" && item.kind === "const" ? item.declarations : [])
         .find(item => item.id.type === "Identifier" && item.id.name === identifier);
-      if (!declaration?.init) invalid("version 必须使用字符串字面量或顶层 const 字符串常量");
+      if (!declaration?.init) invalid(t`${name} 必须使用字符串字面量或顶层 const 字符串常量`);
       expression = declaration.init;
     }
     return literal(expression);
@@ -173,15 +174,24 @@ function parseProvider(source: string) {
   }).safeParse(modelsUrl).success) invalid("模型列表地址须为不含凭据或片段的 HTTP URL");
   const models = mediaModelsSchema.safeParse(value("models") ?? [], validationOptions());
   if (!models.success) invalid(models.error.issues.map(issue => translateMessage(issue.message)).join("; "));
-  return { object, modelProperty: entries.get("models"), id: id as string, label, version: version?.trim(), readme, modelsUrl: modelsUrl as string | undefined, models: models.data };
+  // ACT: apiUrl 只做只读元数据，缺失或非字面量按未声明处理，不因此拒绝整个供应商。
+  let apiUrl: string | undefined;
+  try {
+    const declared = value("apiUrl");
+    if (typeof declared === "string" && /^https?:\/\//i.test(declared)) apiUrl = declared;
+  } catch {
+    apiUrl = undefined;
+  }
+  return { object, modelProperty: entries.get("models"), id: id as string, label, version: version?.trim(), readme, modelsUrl: modelsUrl as string | undefined, models: models.data,
+    apiUrl, asyncMedia: entries.has("submitMedia") && entries.has("queryMedia") };
 }
 
 function metadata(fileName: string, source: string) {
-  const { id, label, version, readme, modelsUrl, models } = parseProvider(source);
+  const { id, label, version, readme, modelsUrl, models, apiUrl, asyncMedia } = parseProvider(source);
   if (fileName !== `${id}.ts`) invalid("供应商 ID 与文件名不一致");
   // ACT: 兼容旧 TF-Router 文件，缺少列表地址时使用内置定义。
   return { fileName, id, label, version, readme, modelsUrl: modelsUrl ?? (id === tfRouter.id ? tfRouter.modelsUrl : undefined), models,
-    revision: createHash("sha256").update(source).digest("hex"), loadError: "" };
+    apiUrl, asyncMedia, revision: createHash("sha256").update(source).digest("hex"), loadError: "" };
 }
 
 async function directory(create = false) {
@@ -229,7 +239,8 @@ export async function listMediaProviders() {
       } catch (error) {
         // ACT: 元数据损坏不影响其他供应商；仍保留原文版本，允许用户明确删除。
         const { source, ...file } = current;
-        return { ...file, label: current.id, version: "", readme: "", models: [], loadError: translateMessage(error instanceof Error ? error.message : "供应商文件无法读取") };
+        return { ...file, label: current.id, version: "", readme: "", models: [], apiUrl: undefined, asyncMedia: false,
+          loadError: translateMessage(error instanceof Error ? error.message : "供应商文件无法读取") };
       }
     }));
 }

@@ -1,6 +1,12 @@
 import { z } from "zod";
 export type { CanvasToolCall, CanvasInfo, CanvasContext } from "@toonflow/tools-scaffold/runtime";
 
+/** 只读画布查询：不修改画布，控制链路不为这些调用触发全图保存。 */
+export const canvasReadOperations = new Set(["getCanvas", "findCanvasNodes", "getCanvasNodes", "getCanvasEdges", "getNodeTools"]);
+
+// ACT: readOnly 与 expectedCanvasId 由控制链路透传；主控并入共享 CanvasToolCall 后可去掉该扩展类型。
+export type CanvasControlRequest = { name: string; args: Record<string, unknown>; readOnly?: boolean; expectedCanvasId?: string };
+
 const nodeId = z.string().min(1).max(256);
 const position = z.strictObject({ x: z.number().finite(), y: z.number().finite() });
 const canvasId = nodeId.optional();

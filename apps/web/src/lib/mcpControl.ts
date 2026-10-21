@@ -6,7 +6,7 @@ import { invalidateNodeModels } from "@toonflow/nodes-scaffold/nodeAi";
 import { saveSettings, settings } from "@/stores/settings";
 import { useWorkspaceStore } from "@/stores/workspace";
 
-type ControlCall = { type: "call"; callId: string; name: string; args: Record<string, unknown>; directory?: string };
+type ControlCall = { type: "call"; callId: string; name: string; args: Record<string, unknown>; directory?: string; expectedCanvasId?: string; readOnly?: boolean };
 type WorkspaceControl = {
   getState(): { directory: string | null; canvasId: string | null; panel: string; tools: NodeToolInfo[]; document?: unknown };
   call(request: ControlCall, signal: AbortSignal): Promise<unknown>;
@@ -79,8 +79,11 @@ export function useMcpControl() {
           method: "POST", headers: { ...headers, "Content-Type": "application/json", "Accept-Language": locale.value },
           body: JSON.stringify({ connectionId, ...(path === "state" ? { revision: ++revision } : {}), ...body }), signal,
         });
-        if (path === "result" && response.status === 404 && callSignal?.aborted) return;
-        if (!response.ok) throw new Error(`MCP ${path} 请求失败（${response.status}）`);
+        // F01：服务端已取消、超时或已从队列移除的命令会拒绝回传（404）；忽略本次回传，不断开控制连接。
+        if (path === "result" && response.status === 404) return;
+        // F07：登录过期只提示重新登录，保持控制连接的重连逻辑，不刷新页面丢草稿。
+        if (response.status === 401) window.dispatchEvent(new CustomEvent("toonflow:unauthorized"));
+        if (!response.ok) throw new Error(`MCP ${path} 请求失败（${response.status}${response.status === 401 ? "，请重新登录" : ""}）`);
       }
       let stopState = () => {};
       const connectionCalls = new Map<string, AbortController>();

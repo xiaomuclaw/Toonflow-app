@@ -13,7 +13,7 @@ export default router.post("/", validateFields({
   url: z.string().url().max(4096).optional(),
   force: z.boolean().optional(),
 }), async (req, res) => {
-  if (!u.workspace.isLocalWorkspaceRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机安装节点", null, 403));
+  if (!u.workspace.canManageRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机安装节点", null, 403));
   const { fileName, source, url, force } = req.body as { fileName?: string; source?: string; url?: string; force?: boolean };
   if (url ? source !== undefined : fileName === undefined || source === undefined) {
     return res.status(400).json(error("请选择文件或填写远端地址", null, 400));

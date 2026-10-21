@@ -515,7 +515,7 @@ async function uploadAttachments(attachments: AgentAttachment[], directory: stri
     if (!attachment.file) continue;
     const extension = attachment.name.match(/\.[a-zA-Z0-9]{1,10}$/)?.[0].toLowerCase() ?? "";
     const path = `assets/chat/${crypto.randomUUID()}${extension}`;
-    await files.write(path, attachment.file, true, signal);
+    await files.write(path, attachment.file, true, signal, "original");
     attachment.path = path;
     attachment.file = undefined;
     signal.throwIfAborted();

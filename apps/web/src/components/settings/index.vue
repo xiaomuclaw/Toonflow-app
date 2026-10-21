@@ -13,15 +13,18 @@
         </template>
       </aside>
       <section class="content" :aria-label="activePanel.label" tabindex="0">
+        <!-- ACT: 设置冲突的可执行恢复入口：重新加载会放弃本地未保存修改（F18）。 -->
+        <el-alert v-if="settingsConflict" class="conflictNotice" type="warning" :closable="false" showIcon
+          title="设置已在其他窗口被修改，本地修改尚未保存">
+          <p class="conflictHint">重新加载会放弃本地未保存的设置修改，请先复制需要的改动。</p>
+          <el-button size="small" type="primary" @click="reloadSettings">重新加载设置</el-button>
+        </el-alert>
         <h2 class="panelTitle">{{ activePanel.label }}</h2>
         <div class="panelContent">
-          <transition name="el-fade-in" mode="out-in">
-            <keep-alive include="personalization">
-              <component
-                :is="activePanel.component"
-                v-bind="['pluginMarket', 'languageModel', 'mediaModel', 'personalization'].includes(activePanel.id) ? { visible } : {}" />
-            </keep-alive>
-          </transition>
+          <!-- ACT: 不包裹 transition/keep-alive：异步面板在部分运行时下会让 out-in 过渡停在 leave 状态，导致切换后内容不更新。 -->
+          <component
+            :is="activePanel.component"
+            v-bind="['pluginMarket', 'languageModel', 'mediaModel', 'personalization'].includes(activePanel.id) ? { visible } : {}" />
         </div>
       </section>
     </div>
@@ -31,6 +34,7 @@
 <script setup lang="ts">
 import { defineAsyncComponent, shallowRef } from "vue";
 import { hasDesktopUpdate } from "@/stores/desktopUpdate";
+import { reloadSettings, settingsConflict } from "@/stores/settings";
 import {
   IconPalette,
   IconSettings,
@@ -42,6 +46,7 @@ import {
   IconPlugConnected,
   IconUserCog,
   IconSubtitlesAi,
+  IconDatabase,
 } from "@tabler/icons-vue";
 
 const settingsPanels = [
@@ -63,6 +68,7 @@ const settingsPanels = [
     component: defineAsyncComponent(() => import("./panels/pluginMarket/index.vue")),
   },
   { id: "mcp", label: "MCP", icon: IconPlugConnected, groupLabel: "其他", component: defineAsyncComponent(() => import("./panels/mcp/index.vue")) },
+  { id: "storageCleanup", label: "存储与清理", icon: IconDatabase, component: defineAsyncComponent(() => import("./panels/storageCleanup/index.vue")) },
   { id: "personalization", label: "个性化", icon: IconUserCog, component: defineAsyncComponent(() => import("./panels/personalization.vue")) },
   { id: "privacy", label: "隐私", icon: IconShieldLock, component: defineAsyncComponent(() => import("./panels/privacy.vue")) },
   { id: "developer", label: "开发者选项", icon: IconCode, component: defineAsyncComponent(() => import("./panels/developer/index.vue")) },

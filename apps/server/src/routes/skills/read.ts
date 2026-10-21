@@ -11,7 +11,7 @@ export default router.get("/", validateFields({
   name: z.string().min(1).max(1024),
   path: z.string().min(1).max(1024).optional(),
 }, "query"), async (req, res) => {
-  if (!u.workspace.isLocalWorkspaceRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机读取技能", null, 403));
+  if (!u.workspace.canManageRequest(req)) return res.status(403).json(error("请在桌面端或服务器本机读取技能", null, 403));
   const release = u.workspaceFile.lockWorkspaceFiles([u.skillFile.directory()]);
   try {
     const { target } = await u.skillFile.locate(req.query.name as string, req.query.path as string | undefined);

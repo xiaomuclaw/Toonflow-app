@@ -28,6 +28,7 @@ import { translate } from "@toonflow/i18n/vue";
 import { computed, nextTick, ref, shallowRef } from "vue";
 import axios from "axios";
 import saveFile from "@/lib/saveFile";
+import { notifyRelocationFailure, notifyRelocationWarning } from "@/lib/workspaceFiles";
 import { ElMessage, ElMessageBox, type DropdownInstance } from "element-plus";
 import { IconChevronRight, IconFolder, IconFolderPlus } from "@tabler/icons-vue";
 
@@ -79,8 +80,14 @@ function showError(error: unknown) {
 async function relocate(entry: AssetEntry, target: string) {
   busy.value = true;
   try {
-    await axios.post("/api/assets/rename", { path: entry.path, target });
+    // R4/§P.5：素材改名与工作区改名同走归属事务，成功响应的 warning（保护仍在，需清理核对）
+    // 必须消费并在既有通知里可见；失败响应的失败原因与保护状态同样保留（错误照原样抛出）。
+    const { data } = await axios.post<{ data?: { warning?: string } }>("/api/assets/rename", { path: entry.path, target });
+    notifyRelocationWarning(data?.data?.warning);
     emit("changed", entry.path, target);
+  } catch (error) {
+    notifyRelocationFailure(error);
+    throw error;
   } finally {
     busy.value = false;
   }

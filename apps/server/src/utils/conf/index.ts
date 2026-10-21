@@ -12,7 +12,7 @@ mkdirSync(dataDirectory, { recursive: true });
 const configDirectory = realpathSync(dataDirectory);
 process.env.TOONFLOW_DATA_DIR = configDirectory;
 
-const config = new conf<{ settings: Record<string, unknown>; toolConfigs: Record<string, Record<string, unknown>>; nodeConfigs: Record<string, Record<string, unknown>>; extConfigs: Record<string, Record<string, unknown>>; remoteConnections: Record<string, RemoteTeam>; a2a: A2aSettings; desktopUpdateAttempt: desktopUpdateAttempt }>({
+const config = new conf<{ settings: Record<string, unknown>; settingsMeta: { revision: string; updatedAt: string }; toolConfigs: Record<string, Record<string, unknown>>; nodeConfigs: Record<string, Record<string, unknown>>; extConfigs: Record<string, Record<string, unknown>>; remoteConnections: Record<string, RemoteTeam>; a2a: A2aSettings; desktopUpdateAttempt: desktopUpdateAttempt }>({
   cwd: configDirectory,
   configName: "settings",
   configFileMode: 0o600,

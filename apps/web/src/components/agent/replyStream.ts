@@ -21,7 +21,9 @@ export async function* readAgentEvents(response: Response, signal: AbortSignal) 
       if (done) lines.push(pending);
       for (const line of lines) {
         if (!line.trim()) continue;
-        const event = JSON.parse(line) as AgentEvent;
+        const event = JSON.parse(line) as AgentEvent | { type: "heartbeat" };
+        // R14: 心跳仅用于保持连接，忽略后继续按原协议处理事件。
+        if (event.type === "heartbeat") continue;
         if (event.type === "error") throw new Error(event.message);
         if (event.type === "done") return;
         yield event;

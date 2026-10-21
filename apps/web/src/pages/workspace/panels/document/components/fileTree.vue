@@ -49,6 +49,8 @@
             <icon-folder v-else-if="data.type === 'directory'" :size="16" aria-hidden="true" />
             <icon-file v-else :size="16" aria-hidden="true" />
             <span class="fileName">{{ data.displayLabel || data.name }}<small v-if="searchTerm.trim()">{{ data.path }}</small></span>
+            <small v-if="availabilityByKey.get(data.key) === 'cleaned'" class="availabilityBadge" title="文件已被清理规则删除；业务记录仍保留，不会自动重新生成">已清理</small>
+            <small v-else-if="availabilityByKey.get(data.key) === 'missing'" class="availabilityBadge" title="工作区中找不到该文件，可能被外部删除">缺失</small>
             <small v-if="data.displayLabel && data.nodeId" class="nodeId" :title="data.nodeId">({{ data.nodeId.slice(0, 8) }}{{ data.nodeId.length > 8 ? '…' : '' }})</small>
           </span>
         </div>
@@ -84,7 +86,7 @@ import type { DropdownInstance } from "element-plus";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/vue-virtual";
 import { IconBox, IconChevronRight, IconFile, IconFilePlus, IconFileSearch, IconFocus2, IconFolder, IconFolderOpen, IconFolderPlus, IconLayoutDashboard, IconListCheck, IconLoader2, IconRefresh, IconSearch } from "@tabler/icons-vue";
-import useWorkspaceFiles from "@/lib/workspaceFiles";
+import useWorkspaceFiles, { queryFileAvailability } from "@/lib/workspaceFiles";
 import { settingsStorage } from "@/stores/settings";
 import { writeClipboardText } from "@/lib/clipboard";
 import { t } from "@toonflow/i18n/vue";
@@ -540,6 +542,8 @@ function fileExtension(item: FileTreeItem) {
 function selectNode(item: FileTreeItem, preview = false) {
   focusedItem.value = item;
   if (searchTerm.value.trim() && (item.type === "directory" || item.type === "canvas")) { locateItem(item); return; }
+  // T11：选中文件时用公共只读查询核对可用性（已清理/缺失显示标记），不触发生成。
+  void refreshRowAvailability(item);
   const selection: TreeSelection | undefined = item.type === "node" && item.nodeId
     ? { canvasPath: item.path, nodeId: item.nodeId, label: item.name }
     : item.type === "file" ? { filePath: item.path, label: item.name } : undefined;
@@ -547,6 +551,19 @@ function selectNode(item: FileTreeItem, preview = false) {
   emit("selectNode", selection);
   emit("open", selection, preview);
   props.params?.params.open(selection, preview);
+}
+
+// T11：文件树消费输出/文件可用性；只对真正的普通文件查询，目录/画布/节点不查询。
+const availabilityByKey = shallowReactive(new Map<string, "cleaned" | "missing">());
+async function refreshRowAvailability(item: FileTreeItem) {
+  const currentDirectory = directory.value;
+  if (!currentDirectory || !item.path || item.type !== "file" || availabilityByKey.has(item.key)) return;
+  try {
+    const state = await queryFileAvailability(currentDirectory, item.path);
+    if (state.state !== "available") availabilityByKey.set(item.key, state.state);
+  } catch {
+    // 查询失败保持无标记；文件读取失败仍由打开动作自行提示。
+  }
 }
 
 function syncCurrentSelection() {
@@ -926,6 +943,16 @@ function loadChildren(item: FileTreeItem): Promise<void> {
         text-overflow: ellipsis;
         white-space: nowrap;
         small { margin-left: 8px; color: var(--el-text-color-secondary); font-size: 10px; }
+      }
+
+      .availabilityBadge {
+        flex-shrink: 0;
+        padding: 0 5px;
+        border-radius: 3px;
+        background: var(--el-color-warning-light-9);
+        color: var(--el-color-warning);
+        font-size: 10px;
+        line-height: 15px;
       }
     }
   }

@@ -1,4 +1,4 @@
-import { canvasSchemas, type CanvasToolCall } from "@toonflow/tool-canvas/runtime";
+import { canvasReadOperations, canvasSchemas, type CanvasToolCall } from "@toonflow/tool-canvas/runtime";
 import type { NodeToolsContext } from "@toonflow/tools-scaffold/runtime";
 
 type CanvasNode = { id: string; type?: string; label?: unknown; position: { x: number; y: number }; selected?: boolean; data: Record<string, unknown> };
@@ -9,10 +9,9 @@ const encoder = new TextEncoder();
 const responseBytes = 64 * 1024;
 const pageBytes = 52 * 1024;
 const scanLimit = 2000;
-const readNames = new Set(["getCanvas", "findCanvasNodes", "getCanvasNodes", "getCanvasEdges", "getNodeTools"]);
 
 export function isCanvasRead(name: string) {
-  return readNames.has(name);
+  return canvasReadOperations.has(name);
 }
 
 function jsonSize(value: unknown, limit = responseBytes) {

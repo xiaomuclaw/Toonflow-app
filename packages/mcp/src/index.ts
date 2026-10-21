@@ -88,6 +88,26 @@ export function createMcpRouter(options: McpOptions) {
   };
   // ACT: 使用支持取消通知的 Streamable HTTP 会话；单进程宿主不持久化 MCP 会话。
   const sessions = new Map<string, NodeStreamableHTTPServerTransport>();
+  // ACT: 空闲回收 + 容量上限，异常重连不会无限累积会话；进行中的请求不被回收（R27）。
+  const sessionActivity = new Map<string, number>();
+  const sessionInFlight = new Set<string>();
+  const sessionIdleTtlMs = 30 * 60 * 1000;
+  const maxSessions = 64;
+  const touchSession = (id: string) => sessionActivity.set(id, Date.now());
+  const closeSession = (id: string) => {
+    const target = sessions.get(id);
+    if (!target) return;
+    sessions.delete(id);
+    sessionActivity.delete(id);
+    void target.close().catch(() => {});
+  };
+  const pruneTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id] of sessions) {
+      if (!sessionInFlight.has(id) && now - (sessionActivity.get(id) ?? 0) > sessionIdleTtlMs) closeSession(id);
+    }
+  }, 5 * 60 * 1000);
+  pruneTimer.unref?.();
   const router = Router();
   router.use((request, response) => (options.runInRequest ?? ((_request, operation) => operation()))(request, async () => {
     try {
@@ -101,10 +121,27 @@ export function createMcpRouter(options: McpOptions) {
       if (!sessionId && isInitializeRequest(request.body)) {
         transport = new NodeStreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID,
-          onsessioninitialized: id => { sessions.set(id, transport!); },
+          onsessioninitialized: id => {
+            if (sessions.size >= maxSessions) {
+              let oldestId: string | undefined;
+              let oldestAt = Infinity;
+              for (const [existingId] of sessions) {
+                if (sessionInFlight.has(existingId)) continue;
+                const at = sessionActivity.get(existingId) ?? 0;
+                if (at < oldestAt) { oldestAt = at; oldestId = existingId; }
+              }
+              if (oldestId) closeSession(oldestId);
+            }
+            sessions.set(id, transport!);
+            touchSession(id);
+          },
         });
         transport.onclose = () => {
-          if (transport?.sessionId) sessions.delete(transport.sessionId);
+          if (transport?.sessionId) {
+            sessions.delete(transport.sessionId);
+            sessionActivity.delete(transport.sessionId);
+            sessionInFlight.delete(transport.sessionId);
+          }
         };
         await createServer().connect(transport);
       }
@@ -112,7 +149,15 @@ export function createMcpRouter(options: McpOptions) {
         response.status(sessionId ? 404 : 400).json({ jsonrpc: "2.0", id: null, error: { code: -32000, message: translateMessage("MCP 会话不存在，请重新连接") } });
         return;
       }
-      await transport.handleRequest(request, response, request.body);
+      if (transport.sessionId) sessionInFlight.add(transport.sessionId);
+      try {
+        await transport.handleRequest(request, response, request.body);
+      } finally {
+        if (transport.sessionId) {
+          sessionInFlight.delete(transport.sessionId);
+          touchSession(transport.sessionId);
+        }
+      }
     } catch (error) {
       if (response.headersSent) {
         response.end();
@@ -123,6 +168,7 @@ export function createMcpRouter(options: McpOptions) {
     }
   }));
   return Object.assign(router, { close: async () => {
+    clearInterval(pruneTimer);
     await Promise.all([...sessions.values()].map(transport => transport.close()));
   } });
 }

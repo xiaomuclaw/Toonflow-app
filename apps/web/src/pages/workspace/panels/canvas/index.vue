@@ -94,6 +94,13 @@
         :disabled="!canvasId || !project?.directory" />
       <nodeSearch ref="nodeSearchRef" :disabled="!active || settingsVisible || !canvasId || !project?.directory" />
     </vue-flow>
+    <el-alert v-if="canvasConflict" class="canvasConflict" type="warning" :closable="false" showIcon :title="canvasConflictMessage">
+      <div class="canvasConflictActions">
+        <span class="canvasConflictFile">{{ canvasConflict.fileName }}</span>
+        <el-button size="small" @click="reloadCanvasFromDisk">重新载入磁盘版本</el-button>
+        <el-button size="small" type="primary" @click="overwriteCanvasFromLocal">保留本地修改</el-button>
+      </div>
+    </el-alert>
     <teleport to="body">
       <el-button
         v-if="edgeDisconnect && findEdge(edgeDisconnect.id)"
@@ -118,7 +125,7 @@
 import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, onScopeDispose, provide, ref, shallowReactive, shallowRef, watch } from "vue";
 import axios from "axios";
 import { debounce } from "lodash-es";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { storeToRefs } from "pinia";
 import { IconUnlink } from "@tabler/icons-vue";
 import * as vueRuntime from "vue";
@@ -167,6 +174,7 @@ import { useNodeToolsContext } from "@toonflow/nodes-scaffold/nodeTools";
 import { useWorkspaceStore } from "@/stores/workspace";
 import { generalSettings } from "@/stores/settings";
 import { getShortcutBindings, shortcutLabel, shortcutMatches, shortcutPressed } from "@/lib/canvasShortcuts";
+import { reportUnauthorized } from "@/lib/authClient";
 import useWorkspaceFiles from "@/lib/workspaceFiles";
 import anonymousData from "@/lib/anonymousData";
 import { dropCanvasFiles, importCanvasFiles, isCanvasFileDrag } from "./canvasDrop";
@@ -201,6 +209,8 @@ const nodeReloads = new Set<string>();
 const nodeErrors = ref<Record<string, string>>({});
 const availableNodes = computed(() => nodeOptions.value.filter(node => nodeTypes.value[node.type] && !nodeErrors.value[node.type]));
 const nodeListLoading = ref(true);
+// ACT: 节点列表请求的在途计数；新旧请求并发或组件卸载使 requestId 失效时，仍能可靠复位 loading。
+let nodeListInflight = 0;
 const remoteNodeTypes = computed(() => [
   ...new Set((flowData.value as { type?: string }[]).map((item) => item.type).filter((type): type is string => !!type?.startsWith("remote-"))),
 ]);
@@ -223,6 +233,11 @@ const flow = useVueFlow(props.runtimeKey);
 const nodeDocument: NodeDocumentContext = { targets: shallowReactive(new Map()), mounts: new Map(), states: shallowReactive(new Map()) };
 const canvasDirty = ref(false);
 const canvasSaveError = ref("");
+type CanvasRevision = { revision: string; encoding: "utf-8" | "utf-8-bom" | "utf-16le" | "utf-16be" };
+// ACT: 每份画布缓存最近一次落盘的版本标识；缺失时读一次磁盘快照，写入始终带 expectedRevision。
+const canvasRevisions = new Map<string, CanvasRevision>();
+const canvasConflict = ref<{ directory: string; fileName: string }>();
+const canvasConflictMessage = "画布已在其他窗口被修改，本地修改未保存";
 const documentObservers = new Set<() => void>();
 onScopeDispose(() => { for (const release of documentObservers) release(); });
 provide("nodeDocument", nodeDocument);
@@ -275,7 +290,15 @@ function getCanvasContext() {
 const canvasReady = computed(() => !!canvasId.value && !nodeListLoading.value && nodeLoads.size === 0);
 provide("canvas", getCanvasContext);
 defineExpose({ canvasId, canvasReady, getCanvasContext, readDocumentNode, saveDocumentNode, mountDocumentNode, observeDocumentNode, prepareCanvasDelete, flushSave: flushCanvasSave, cancelSave: cancelCanvasSave,
-  syncCanvasPath: (previous: string, target: string) => canvasMenuRef.value?.syncCanvasPath(previous, target),
+  syncCanvasPath: (previous: string, target: string) => {
+    const directory = project.value?.directory;
+    if (directory) {
+      const cached = canvasRevisions.get(revisionKey(directory, previous));
+      if (cached) canvasRevisions.set(revisionKey(directory, target), cached);
+      canvasRevisions.delete(revisionKey(directory, previous));
+    }
+    canvasMenuRef.value?.syncCanvasPath(previous, target);
+  },
   getMentionNodes: () => flow.nodes.value, findMentionNode: flow.findNode,
   getRetainedNodes: canvasHistory.getRetainedNodes,
   get saveBusy() { return savePaused; }, get loadError() { return canvasMenuRef.value?.loadError ?? ""; },
@@ -445,7 +468,7 @@ async function saveDocumentNode(directory: string, canvasPath: string, nodeId: s
       const output = data.outputs?.[handleId];
       if (output?.dataType === "STRING") output.value = text;
       else (data.outputs ??= {})[handleId] = { dataType: "STRING", value: text };
-      await files.writeJson(canvasPath, canvas);
+      await writeCanvasFile(directory, canvasPath, canvas);
     }
     checkDocumentDirectory(directory);
   });
@@ -527,18 +550,110 @@ let savePaused = false;
 let saveCancelled = false;
 let changedWhilePaused = false;
 let saveRevision = 0;
+
+function revisionKey(directory: string, fileName: string) {
+  return `${directory}\u0000${fileName}`;
+}
+
+function isRevisionConflict(error: unknown) {
+  return axios.isAxiosError<{ data?: { code?: string } }>(error) && error.response?.status === 409 && error.response.data?.data?.code === "ESTALE";
+}
+
+function canvasConflictError(conflict: { directory: string; fileName: string }) {
+  return new Error(`${canvasConflictMessage}（${conflict.fileName}）`);
+}
+
+function readCanvasRevision(directory: string, fileName: string) {
+  return useWorkspaceFiles(directory).readTextSnapshot(fileName).then(
+    ({ revision, encoding }) => ({ revision, encoding }),
+    (error: unknown) => {
+      // F06：只有文件确实不存在才按首次写入处理；其他读取失败必须报错，绝不降级为普通覆盖写。
+      if (axios.isAxiosError<{ data?: { code?: string } }>(error) && error.response?.status === 404
+        && (error.response.data as { data?: { code?: string } } | undefined)?.data?.code === "ENOENT") return undefined;
+      throw error;
+    }
+  );
+}
+
+async function writeCanvasFile(directory: string, fileName: string, data: unknown) {
+  const files = useWorkspaceFiles(directory);
+  const key = revisionKey(directory, fileName);
+  const recorded = canvasRevisions.get(key);
+  // F06：优先使用读取该内容时记录的版本；冲突处理等场景明确放弃记录后，才重新读取磁盘当前版本。
+  let snapshot: { revision: string; encoding: "utf-8" | "utf-8-bom" | "utf-16le" | "utf-16be" } | undefined =
+    recorded ?? canvasMenuRef.value?.takeCanvasRevision(directory, fileName);
+  const text = `${JSON.stringify(data, null, 2)}\n`;
+  // W2：回写清单与不可变文本由同一份冻结快照导出（text 由该 data 序列化生成），
+  // 禁止在收到保存响应后读取当前节点拼清单，否则旧 ACK 会清掉较晚输出的绑定。
+  const writeBackManifest = collectWriteBackManifest((data as { nodes?: unknown } | null)?.nodes);
+  try {
+    if (snapshot) {
+      snapshot = { ...snapshot, revision: await files.writeTextSnapshot(fileName, text, snapshot) };
+    } else {
+      const current = await readCanvasRevision(directory, fileName);
+      if (current) snapshot = { ...current, revision: await files.writeTextSnapshot(fileName, text, current) };
+      else {
+        // 磁盘上确认没有这份画布（首次写入或已被外部删除）时按原行为重建，再读回版本继续参与冲突检测。
+        await files.write(fileName, text);
+        snapshot = await readCanvasRevision(directory, fileName);
+      }
+    }
+  } catch (error) {
+    // 写入失败时放回读取内容时的版本：重试仍以读取时的版本检测冲突，不临时改读最新版本。
+    if (!recorded && snapshot) canvasMenuRef.value?.rememberCanvasRevision(fileName, { directory, revision: snapshot.revision, encoding: snapshot.encoding });
+    // F07：登录过期只提示重新登录并保留本地草稿；保存失败本身仍按原逻辑上报。
+    reportUnauthorized(error);
+    if (isRevisionConflict(error)) {
+      canvasConflict.value = { directory, fileName };
+      canvasSaveError.value = canvasConflictMessage;
+      ElMessage.warning(`${canvasConflictMessage}：${fileName}`);
+    }
+    throw error;
+  }
+  if (snapshot) canvasRevisions.set(key, snapshot);
+  // F05/W2：画布已按预期版本保存成功；事件携带同一快照导出的回写清单与本次 revision，节点据此精确清理临时关联。
+  window.dispatchEvent(new CustomEvent("toonflow:canvas-saved", { detail: { directory, fileName, revision: snapshot?.revision ?? "", manifest: writeBackManifest } }));
+}
+
+/** W2：从画布节点输出导出回写清单条目；只收集携带任务最小结果元数据（taskId + writeBackToken）的媒体输出。 */
+function collectWriteBackManifest(nodes: unknown): { nodeId: string; taskId: string; outputPath: string; writeBackToken: string }[] {
+  const entries: { nodeId: string; taskId: string; outputPath: string; writeBackToken: string }[] = [];
+  if (!Array.isArray(nodes)) return entries;
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const id = (node as { id?: unknown }).id;
+    const outputs = (node as { data?: { outputs?: unknown } }).data?.outputs;
+    if (typeof id !== "string" || !outputs || typeof outputs !== "object") continue;
+    for (const output of Object.values(outputs as Record<string, { value?: unknown } | undefined>)) {
+      const value = output?.value;
+      if (!value || typeof value !== "object") continue;
+      const { url, taskId, writeBackToken } = value as { url?: unknown; taskId?: unknown; writeBackToken?: unknown };
+      if (typeof url !== "string" || typeof taskId !== "string" || typeof writeBackToken !== "string") continue;
+      entries.push({ nodeId: id, taskId, outputPath: url, writeBackToken });
+    }
+  }
+  return entries;
+}
+
 const saveCanvas = debounce((directory: string, fileName: string) => {
   const flow = toObject();
   const revision = saveRevision;
-  // ACT: 同页保存按顺序完成，防止慢请求覆盖后续修改；不处理多个客户端的并发编辑。
+  // ACT: 同页保存按顺序完成，防止慢请求覆盖后续修改；跨窗口冲突由磁盘版本号拦截。
   saving = saving.then(async () => {
+    if (canvasConflict.value) {
+      // 冲突未解决前暂停自动保存，保留本地内容，避免反复冲突与提示刷屏。
+      saveError = canvasConflictError(canvasConflict.value);
+      return;
+    }
     try {
-      await useWorkspaceFiles(directory).writeJson(fileName, { toonflowCanvas: true, nodes: flow.nodes, edges: flow.edges, viewport: flow.viewport });
+      await writeCanvasFile(directory, fileName, { toonflowCanvas: true, nodes: flow.nodes, edges: flow.edges, viewport: flow.viewport });
       saveError = undefined;
       canvasSaveError.value = "";
       if (revision === saveRevision) canvasDirty.value = false;
     } catch (err) {
-      saveError = err;
+      reportUnauthorized(err);
+      saveError = isRevisionConflict(err) ? canvasConflictError({ directory, fileName }) : err;
+      if (isRevisionConflict(err)) return;
       canvasSaveError.value = axios.isAxiosError<{ message?: string }>(err) ? err.response?.data.message || err.message : err instanceof Error ? err.message : "画布保存失败";
       ElMessage.error(
         axios.isAxiosError<{ message?: string }>(err)
@@ -550,6 +665,54 @@ const saveCanvas = debounce((directory: string, fileName: string) => {
     }
   });
 }, 500);
+
+// R07：清冲突提示不等于清版本。这里只清提示与错误状态，同次读取取得的 revision 继续参与下一次保存的冲突检测。
+function dismissCanvasConflict() {
+  canvasConflict.value = undefined;
+  saveError = undefined;
+  canvasSaveError.value = "";
+}
+
+// 用户明确选择“保留本地修改”覆盖其他窗口时，才放弃已记录的读取版本；下一次保存重新读取磁盘当前版本。
+function discardCanvasRevision(conflict: { directory: string; fileName: string }) {
+  canvasRevisions.delete(revisionKey(conflict.directory, conflict.fileName));
+  canvasMenuRef.value?.forgetCanvasRevision(conflict.fileName);
+}
+
+// 明确丢弃本地修改，重新载入磁盘上其他窗口保存的版本。
+async function reloadCanvasFromDisk() {
+  const conflict = canvasConflict.value;
+  if (!conflict) return;
+  const confirmed = await ElMessageBox.confirm("将放弃本窗口未保存的画布修改，重新载入磁盘上的最新版本。", "重新载入磁盘版本", {
+    type: "warning", confirmButtonText: "重新载入", cancelButtonText: "取消", closeOnClickModal: false,
+  }).then(() => true, () => false);
+  if (!confirmed || canvasConflict.value !== conflict) return;
+  try {
+    // R07：先读取磁盘内容并获得同源 revision；失败时保留草稿、冲突与旧版本。
+    const loaded = await canvasMenuRef.value?.reloadCanvas(conflict.fileName);
+    if (!loaded) throw new Error("画布菜单尚未就绪，请重试");
+    // 重载成功后保存入口必须继续使用这次读取的版本：其他窗口再次保存后本窗口会再次 409，而不是为旧内容临时读最新版本背书。
+    canvasRevisions.set(revisionKey(conflict.directory, conflict.fileName), loaded);
+    dismissCanvasConflict();
+    ElMessage.success("已重新载入磁盘版本");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "重新载入画布失败");
+  }
+}
+
+// 保留本地内容，丢弃其他窗口的较新版本；用户确认后按磁盘当前版本继续写入。
+async function overwriteCanvasFromLocal() {
+  const conflict = canvasConflict.value;
+  if (!conflict) return;
+  const confirmed = await ElMessageBox.confirm("将使用本窗口内容覆盖磁盘上的较新版本，其他窗口的修改会丢失。", "保留本地修改", {
+    type: "warning", confirmButtonText: "覆盖保存", cancelButtonText: "取消", closeOnClickModal: false,
+  }).then(() => true, () => false);
+  if (!confirmed || canvasConflict.value !== conflict) return;
+  // 这是用户明确的覆盖意图：放弃旧版本记录，由保存读取磁盘当前版本写回本地内容（不用于普通保存路径）。
+  discardCanvasRevision(conflict);
+  dismissCanvasConflict();
+  if (conflict.directory === project.value?.directory && conflict.fileName === canvasId.value) scheduleCanvasSave();
+}
 
 function scheduleCanvasSave() {
   if (saveCancelled) return;
@@ -947,8 +1110,21 @@ onBeforeUnmount(() => {
 const nodeWindow = window as typeof window & {
   toonflowNodeHost?: { vue: typeof vueRuntime; vueFlow: typeof vueFlowRuntime; elementPlus: typeof elementPlusRuntime; three: typeof threeRuntime; ai: { runAgentLoop: typeof runAgentLoop; createAssistantMessageEventStream: typeof createAssistantMessageEventStream } };
   toonflowNodes?: NodeTypesObject;
+  /** 只读加载态诊断（供无 DevTools 的远程环境定位节点骨架屏问题）。 */
+  canvasDiagnostics?: () => Record<string, unknown>;
 };
 nodeWindow.toonflowNodeHost = { vue: vueRuntime, vueFlow: vueFlowRuntime, elementPlus: elementPlusRuntime, three: threeRuntime, ai: { runAgentLoop, createAssistantMessageEventStream } };
+nodeWindow.canvasDiagnostics = () => ({
+  canvasId: canvasId.value,
+  loadRequest,
+  nodeListInflight,
+  nodeListLoading: nodeListLoading.value,
+  nodeLoads: [...nodeLoads.keys()],
+  nodeTypes: Object.keys(nodeTypes.value),
+  nodeErrors: { ...nodeErrors.value },
+  remoteNodeTypes: [...remoteNodeTypes.value],
+  flowNodeTypes: [...new Set((flowData.value as { type?: string }[]).map(item => item.type).filter(Boolean))],
+});
 provide("nodeConfig", (nodeType: string) => nodeConfigs.value[nodeType] ?? {});
 provide("workspaceFiles", () => {
   const directory = project.value?.directory;
@@ -1007,6 +1183,7 @@ async function loadRemoteNodes(reloadName?: string) {
   if (reloadName) nodeReloads.add(reloadName);
   const requestId = ++loadRequest;
   const signal = canvasController.signal;
+  nodeListInflight += 1;
   nodeListLoading.value = true;
   try {
     const { data } = await axios.get<{ code: number; data: { name: string; displayName: string; url: string; enabled?: boolean; config?: Record<string, unknown> }[] }>(
@@ -1051,7 +1228,9 @@ async function loadRemoteNodes(reloadName?: string) {
   } catch (error) {
     if (requestId === loadRequest) console.error("获取远端节点列表失败", error);
   } finally {
-    if (requestId === loadRequest) nodeListLoading.value = false;
+    // ACT: 以在途计数复位 loading；早期请求因 requestId 失效或组件卸载时不再让骨架屏永久停留。
+    nodeListInflight = Math.max(0, nodeListInflight - 1);
+    if (nodeListInflight === 0) nodeListLoading.value = false;
   }
 }
 
@@ -1107,6 +1286,32 @@ const defaultEdgeOptions = markRaw({
     padding: 8px;
     margin: -8px;
     border-radius: 4px;
+  }
+
+  .canvasConflict {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+    z-index: 6;
+    width: min(560px, calc(100% - 32px));
+    transform: translateX(-50%);
+
+    .canvasConflictActions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+
+      .canvasConflictFile {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--el-text-color-secondary);
+        font-size: 12px;
+      }
+    }
   }
 }
 .edgeDisconnect {

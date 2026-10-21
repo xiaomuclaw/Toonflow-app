@@ -46,7 +46,8 @@ import { Panel, useVueFlow, type FlowExportObject } from "@vue-flow/core";
 import { ElMessage, ElMessageBox, type InputInstance } from "element-plus";
 import { IconEdit, IconCheck, IconChevronDown, IconPlus, IconTrash } from "@tabler/icons-vue";
 import { useWorkspaceStore } from "@/stores/workspace";
-import useWorkspaceFiles from "@/lib/workspaceFiles";
+import { reportUnauthorized } from "@/lib/authClient";
+import useWorkspaceFiles, { type TextSnapshot } from "@/lib/workspaceFiles";
 import { getCanvasAssetDirectories, isCanvasFile } from "@/pages/workspace/canvasFile";
 
 const props = defineProps<{
@@ -88,6 +89,8 @@ const nameInputs = ref<InputInstance[]>([]);
 const canvasName = ref("");
 const renameError = ref("");
 const { toObject, setNodes, setEdges, setViewport } = useVueFlow();
+// F06：读取画布内容时同时记录该内容的版本标识；首次保存必须使用读取时的版本。
+const loadedRevisions = new Map<string, { directory: string; revision: string; encoding: TextSnapshot["encoding"] }>();
 
 watch(() => props.directory, async (directory, _previous, onCleanup) => {
   let cancelled = false;
@@ -134,6 +137,8 @@ watch(() => props.directory, async (directory, _previous, onCleanup) => {
 }, { immediate: true });
 
 function errorMessage(err: unknown, fallback: string) {
+  // F07：工作区文件接口的 401 统一上报登录过期状态条，不在此处刷新页面。
+  reportUnauthorized(err);
   return axios.isAxiosError<{ message?: string }>(err) ? err.response?.data.message || fallback : err instanceof Error ? err.message : fallback;
 }
 
@@ -153,6 +158,46 @@ function checkCanvasDirectory(directory: string, signal?: AbortSignal) {
   if (props.directory !== directory) throw new Error("工作目录已切换，本次画布操作已停止");
 }
 
+async function readCanvasFlow(canvas: Canvas, directory: string, signal?: AbortSignal) {
+  // F06：内容与版本必须来自同一次读取；首次保存使用这里的 revision，不能用保存时的最新版本为旧内容背书。
+  const snapshot = await useWorkspaceFiles(directory).readTextSnapshot(canvas.id, { signal });
+  checkCanvasDirectory(directory, signal);
+  let data: Partial<NonNullable<Canvas["flow"]>> & { toonflowCanvas?: boolean } | null;
+  try {
+    data = JSON.parse(snapshot.text) as typeof data;
+  } catch {
+    throw new Error("画布文件格式无效");
+  }
+  if (data?.toonflowCanvas !== true || !Array.isArray(data.nodes) || !Array.isArray(data.edges) || !data.viewport
+    || ![data.viewport.x, data.viewport.y, data.viewport.zoom].every(Number.isFinite) || data.viewport.zoom <= 0) throw new Error("画布文件格式无效");
+  // 旧画布可能保存了临时导出进度，重新打开时任务已不存在。
+  for (const node of data.nodes) if (node.type === "remote-videoNode" && node.data) delete node.data.exportProgress;
+  loadedRevisions.set(canvas.id, { directory, revision: snapshot.revision, encoding: snapshot.encoding });
+  // R07：同一次读取的 revision 随内容一起返回，冲突重载后仍以这次读取的版本参与冲突检测。
+  return { nodes: data.nodes, edges: data.edges, viewport: data.viewport, revision: snapshot.revision, encoding: snapshot.encoding };
+}
+
+/**
+ * 取走该画布读取内容时记录的版本标识；只能由首次保存消费一次，读取失败不得退回普通覆盖写。
+ */
+function takeCanvasRevision(directory: string, fileName: string) {
+  const record = loadedRevisions.get(fileName);
+  if (!record) return undefined;
+  loadedRevisions.delete(fileName);
+  if (record.directory !== directory) return undefined;
+  return { revision: record.revision, encoding: record.encoding };
+}
+
+/** 写入失败时把读取时的版本放回：重试仍以读取内容时的版本参与冲突检测，不会改读最新版本为旧内容背书。 */
+function rememberCanvasRevision(fileName: string, record: { directory: string; revision: string; encoding: TextSnapshot["encoding"] }) {
+  loadedRevisions.set(fileName, record);
+}
+
+/** 冲突处理等场景明确放弃已记录的读取版本，由下一次保存重新读取磁盘当前版本。 */
+function forgetCanvasRevision(fileName: string) {
+  loadedRevisions.delete(fileName);
+}
+
 async function applyCanvas(canvasId: string, directory: string, signal?: AbortSignal) {
   checkCanvasDirectory(directory, signal);
   const nextCanvas = canvases.value.find(canvas => canvas.id === canvasId);
@@ -164,15 +209,7 @@ async function applyCanvas(canvasId: string, directory: string, signal?: AbortSi
     checkCanvasDirectory(directory, signal);
     return;
   }
-  if (!nextCanvas.flow) {
-    const data = await useWorkspaceFiles(directory).readJson<Partial<NonNullable<Canvas["flow"]>> & { toonflowCanvas?: boolean } | null>(nextCanvas.id);
-    checkCanvasDirectory(directory, signal);
-    if (data?.toonflowCanvas !== true || !Array.isArray(data.nodes) || !Array.isArray(data.edges) || !data.viewport
-      || ![data.viewport.x, data.viewport.y, data.viewport.zoom].every(Number.isFinite) || data.viewport.zoom <= 0) throw new Error("画布文件格式无效");
-    // 旧画布可能保存了临时导出进度，重新打开时任务已不存在。
-    for (const node of data.nodes) if (node.type === "remote-videoNode" && node.data) delete node.data.exportProgress;
-    nextCanvas.flow = { nodes: data.nodes, edges: data.edges, viewport: data.viewport };
-  }
+  if (!nextCanvas.flow) nextCanvas.flow = await readCanvasFlow(nextCanvas, directory, signal);
   await props.flushSave();
   checkCanvasDirectory(directory, signal);
   if (currentCanvas) currentCanvas.flow = toObject();
@@ -187,6 +224,27 @@ async function applyCanvas(canvasId: string, directory: string, signal?: AbortSi
   boundCanvas.value = nextCanvas;
   activeCanvasId.value = nextCanvas.id;
   signal?.throwIfAborted();
+}
+
+// 冲突处理：放弃本窗口内容，重新载入磁盘上其他窗口保存的版本。
+// R07：返回与内容同源的 revision；调用方清除冲突提示时不得清掉它，下一次保存仍按该版本检测冲突。
+async function reloadCanvas(canvasId: string, signal?: AbortSignal) {
+  const directory = getCanvasDirectory(signal);
+  const canvas = canvases.value.find(item => item.id === canvasId);
+  if (!canvas) throw new Error("画布不存在，请重新获取画布列表");
+  if (activeCanvasId.value !== canvas.id) throw new Error("画布已切换，请重新载入");
+  const flow = await readCanvasFlow(canvas, directory, signal);
+  canvas.flow = flow;
+  activeCanvasId.value = "";
+  setNodes(flow.nodes);
+  setEdges(flow.edges.map(({ interactionWidth, ...edge }) => edge));
+  await setViewport(flow.viewport);
+  await nextTick();
+  checkCanvasDirectory(directory, signal);
+  boundCanvas.value = canvas;
+  activeCanvasId.value = canvas.id;
+  signal?.throwIfAborted();
+  return { revision: flow.revision, encoding: flow.encoding };
 }
 
 async function switchCanvas(canvasId: string, signal?: AbortSignal) {
@@ -276,6 +334,9 @@ async function createCanvasFile(directory: string, name?: string, signal?: Abort
     const id = `${canvasName}.json`;
     try {
       await files.writeJson(id, { toonflowCanvas: true, ...flow }, true);
+      // 记录刚创建文件的版本，后续首次保存据此参与冲突检测；读取失败只影响冲突检测，不阻塞创建。
+      const snapshot = await files.readTextSnapshot(id).catch(() => undefined);
+      if (snapshot) loadedRevisions.set(id, { directory, revision: snapshot.revision, encoding: snapshot.encoding });
       return { id, name: canvasName, flow };
     } catch (err) {
       if (name !== undefined || !axios.isAxiosError<{ data?: { code?: string } }>(err) || err.response?.status !== 409 || err.response.data.data?.code !== "EEXIST") throw err;
@@ -379,6 +440,11 @@ async function renameCanvasFile(id: string, name: string, directory: string, sig
     await useWorkspaceFiles(directory).rename(id, target);
     checkCanvasDirectory(directory);
     // 文件已改名时先更新保存路径，再响应取消，避免自动保存重新创建旧文件。
+    const revision = loadedRevisions.get(id);
+    if (revision) {
+      loadedRevisions.delete(id);
+      loadedRevisions.set(target, revision);
+    }
     if (activeCanvasId.value === id) activeCanvasId.value = target;
     if (newCanvasId.value === id) newCanvasId.value = target;
     if (editingId.value === id) editingId.value = target;
@@ -390,6 +456,12 @@ async function renameCanvasFile(id: string, name: string, directory: string, sig
 }
 
 function syncCanvasPath(previous: string, target: string) {
+  // 重命名后读取版本随画布路径一起迁移，首次保存仍使用读取内容时的版本。
+  const revision = loadedRevisions.get(previous);
+  if (revision) {
+    loadedRevisions.delete(previous);
+    loadedRevisions.set(target, revision);
+  }
   if (activeCanvasId.value === previous) activeCanvasId.value = target;
   if (newCanvasId.value === previous) newCanvasId.value = target;
   if (editingId.value === previous) editingId.value = target;
@@ -440,7 +512,7 @@ function syncDocumentNode(canvasId: string, nodeId: string, handleId: string, te
   else if (inline) (data.outputs ??= {})[handleId] = { dataType: "STRING", value: text };
 }
 
-defineExpose({ getCanvases, addCanvas, switchCanvas, renameCanvas, syncCanvasPath, syncDocumentNode, loadError });
+defineExpose({ getCanvases, addCanvas, switchCanvas, renameCanvas, syncCanvasPath, syncDocumentNode, reloadCanvas, loadError, takeCanvasRevision, rememberCanvasRevision, forgetCanvasRevision });
 </script>
 
 <style lang="scss" scoped>
