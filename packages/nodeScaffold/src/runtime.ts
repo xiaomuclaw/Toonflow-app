@@ -11,4 +11,4 @@ export * from "./nodeAi";
 export * from "./nodeFfmpeg";
 export * from "./nodeAsr";
 export { useMediaTask, type MediaTaskOutput, type MediaTaskState } from "./useMediaTask";
-export { showNodeError } from "@toonflow/node-shared/showNodeError";
+export { showNodeError } from "./showNodeError";
